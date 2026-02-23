@@ -15,7 +15,7 @@ French_PPA/
 │   ├── solar_patterns.db
 │   ├── wind_patterns.db
 │   ├── load_patterns.db
-│   ├── KEPCO_france.xlsx
+│   ├── TURPE_france.xlsx
 │   └── wind_grid_france.xlsx
 └── gisdata/
 """
@@ -318,18 +318,18 @@ def create_industrial_load_pattern(year: int = 2030, output_db: Path | None = No
 
 
 # =============================================================
-# 5) KEPCO_FRANCE.XLSX (TURPE-like) → database/KEPCO_france.xlsx
+# 5) TURPE_FRANCE.XLSX (TURPE-like) → database/TURPE_france.xlsx
 # =============================================================
 
-def create_kepco_france_excel(output_path: Path | None = None) -> Path:
+def create_TURPE_france_excel(output_path: Path | None = None) -> Path:
     """
-    Crée un Excel au format "KEPCO.xlsx" compatible avec ton parseur :
+    Crée un Excel au format "TURPE.xlsx" compatible avec ton parseur :
     - timezone
     - season
     - contract
     - HTB1 / HTB2 / HTB3
     """
-    output_path = output_path or (DB_DIR / "KEPCO_france.xlsx")
+    output_path = output_path or (DB_DIR / "TURPE_france.xlsx")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     months_fr = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -416,8 +416,8 @@ if __name__ == "__main__":
     print("\n--- 1) Grid France ---")
     create_grid_france_csv()
 
-    print("\n--- 2) Tarifs réseau (KEPCO_france.xlsx) ---")
-    create_kepco_france_excel()
+    print("\n--- 2) Tarifs réseau (TURPE_france.xlsx) ---")
+    create_TURPE_france_excel()
 
     print("\n--- 3) Wind grid (wind_grid_france.xlsx) ---")
     create_wind_grid_france()

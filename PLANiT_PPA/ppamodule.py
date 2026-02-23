@@ -2,26 +2,26 @@ import pandas as pd
 import numpy as np
 import PLANiT_PPA.costutils as _cost
 import PLANiT_PPA.KEPCOutils as _kepco
-import pypsa
+import pypsa 
 
 class PPAModel:
     """
     This class encapsulates the entire PPA modeling code.
-    The only parts you need to change are passed as arguments
+    The only parts you need to change are passed as arguments.
     to the constructor (above the ### From here to the end ### comment).
     """
 
     def __init__(
             self,
             # --- USER INPUTS (formerly the section above ### From here to the end ###) ---
-            loads_config,
-            battery_include,
-            currency_exchange,
-            max_grid_share,
-            sense,
-            rate_increase,
-            selected_sheet,
-            carbonprice_init,
+            loads_config, 
+            battery_include, 
+            currency_exchange, 
+            max_grid_share, 
+            sense, 
+            rate_increase, 
+            selected_sheet, 
+            carbonprice_init, 
             carbonprice_rate,
             rec_grid_init,
             rec_reduction,
