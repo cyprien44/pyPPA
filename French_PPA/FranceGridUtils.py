@@ -1,664 +1,1023 @@
 """
 FranceGridUtils.py
 ==================
-Remplacement de KEPCOutils.py pour le contexte français.
+Utilitaires de données marché et métriques de sites pour le French PPA Model.
 
-Contexte économique :
-- En France, un industriel HTB (>50MW) paie l'électricité via :
-  1. Le TURPE HTB (Tarif d'Utilisation des Réseaux Publics) fixé par la CRE
-  2. Le prix de l'énergie : soit marché EPEX Spot Day-Ahead, soit contrat à terme
-  3. Les taxes : TICFE (ex-CSPE), CTA, TVA (souvent récupérable pour les industriels)
+Remplace KEPCOutils.py — adapté au contexte économique français.
 
-- Les Garanties d'Origine (GO) remplacent les RECs coréens.
-  Prix marché GO en France : ~5-15 €/MWh (vs 80 000 KRW/MWh pour les RECs coréens)
+Modules :
+  1. TURPE HTB          — chargement + calcul composante énergie horaire
+  2. Profil de coût réseau — process_france_grid_data() (équivalent process_kepco_data)
+  3. Projection multi-annuelle — multiyear_pricing_france()
+  4. Garanties d'Origine — create_go_grid()
+  5. Métriques de site   — compute_site_metrics() : capture rate, corrélation, LCOE
+  6. Capture price effective — avec clauses curtailment/prix négatifs
+  7. Screening de sites  — score composite marge × corrélation
+  8. Grid info France    — trajectoires CAPEX/CO2/ENR 2023-2050
 
-- L'EU ETS (European Emissions Trading System) remplace l'ETS coréen.
-  Prix CO2 en 2024 : ~60-70 €/tCO2
+Contexte économique France :
+  - TURPE HTB fixé par la CRE (revue annuelle, ~+4-6%/an depuis 2020)
+  - EPEX Spot Day-Ahead : marché de référence (RTE/EPEX SE)
+  - TICFE : Taxe Intérieure sur la Consommation Finale d'Électricité
+  - CTA : Contribution Tarifaire d'Acheminement
+  - GO (Garanties d'Origine) : 5-15 €/MWh en 2024 (EEX)
+  - EU ETS : ~60-70 €/tCO2 en 2024
 
-Source des données :
-- EPEX Spot historique : https://data.rte-france.com (API gratuite après inscription)
-- TURPE HTB : CRE - https://www.cre.fr/Electricite/Reseaux-d-electricite/Tarifs-d-acces
-- Intensité CO2 / mix : https://odre.opendatasoft.com (eco2mix RTE)
-- Prix GO : EEX / AIB
+Sources :
+  TURPE : https://www.cre.fr/Electricite/Reseaux-d-electricite/Tarifs-d-acces
+  EPEX  : https://odre.opendatasoft.com (prix-spot-da-horaires)
+  CO2   : https://odre.opendatasoft.com (eco2mix-national-cons-def)
+  GO    : https://www.eex.com/en/market-data/environmental-markets
 """
 
-import pandas as pd
-import numpy as np
-import requests
-import sqlite3
+from __future__ import annotations
+
 import os
+import sqlite3
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
 
 
-# ============================================================
-# 1. REMPLACEMENT DE process_kepco_data()
-#    → process_france_grid_data()
-# ============================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# CHEMINS & CONSTANTES
+# ─────────────────────────────────────────────────────────────────────────────
 
-def load_turpe_params(turpe_filepath: str = None, sheet: str = "HTB2",
+_HERE    = Path(__file__).resolve().parent
+_DB_DIR  = _HERE / "database"
+
+# TURPE 6 HTB2 MU (Moyenne Utilisation) — valeurs par défaut CRE Nov 2024
+# Source : https://www.cre.fr (décision du 18 janvier 2024)
+_TURPE_DEFAULTS = {
+    "contract_fee_eur_kw_year": 7.1,   # Composante puissance souscrite HTB2 (€/kW/an)
+    "HPSH": 8.924,   # HP Saison Haute   (€/MWh)
+    "HCSH": 6.824,   # HC Saison Haute
+    "HPSB": 5.354,   # HP Saison Basse
+    "HCSB": 3.570,   # HC Saison Basse
+    "HPTE": 11.444,  # HP Très Haute saison (pointe hiver extrême — rare)
+    # Alias HP/HC pour rétro-compatibilité
+    "HPH": 8.924, "HCH": 6.824, "HPE": 5.354, "HCE": 3.570,
+    "ticfe": 0.5,            # TICFE (€/MWh) — taux industrie 2024
+    "cta":   0.3,            # CTA (€/MWh)
+    "gestion_eur_an": 9873.3, # Composante gestion annuelle (€/an)
+}
+
+_MONTHS_ABR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+# Saisons TURPE : Haute = nov-mars, Basse = avr-oct
+_SEASON_DEFAULT = {
+    "Jan":"Haute","Feb":"Haute","Mar":"Haute",
+    "Apr":"Basse","May":"Basse","Jun":"Basse",
+    "Jul":"Basse","Aug":"Basse","Sep":"Basse",
+    "Oct":"Basse","Nov":"Haute","Dec":"Haute",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS INTERNES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_turpe_file(filepath: str | None = None) -> str | None:
+    if filepath and os.path.exists(filepath):
+        return filepath
+    candidates = [
+        str(_DB_DIR / "TURPE_france.xlsx"),
+        str(_HERE / "TURPE_france.xlsx"),
+        "database/TURPE_france.xlsx",
+        "TURPE_france.xlsx",
+    ]
+    return next((c for c in candidates if os.path.exists(c)), None)
+
+
+def _read_sqlite_series(db: Path, table: str, idx: str, col: str) -> pd.Series | None:
+    """Lit une série depuis SQLite. Retourne None si absente."""
+    if not db.exists():
+        return None
+    conn = sqlite3.connect(str(db))
+    try:
+        df = pd.read_sql(f"SELECT {idx},{col} FROM {table}", conn,
+                         index_col=idx, parse_dates=[idx])
+        conn.close()
+        return df[col]
+    except Exception:
+        conn.close()
+        return None
+
+
+def _read_sqlite_all(db: Path, table: str, idx: str) -> pd.DataFrame | None:
+    """Lit toutes les colonnes d'une table SQLite."""
+    if not db.exists():
+        return None
+    conn = sqlite3.connect(str(db))
+    try:
+        df = pd.read_sql(f"SELECT * FROM {table}", conn,
+                         index_col=idx, parse_dates=[idx])
+        conn.close()
+        return df
+    except Exception:
+        conn.close()
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. TURPE HTB
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_turpe_params(turpe_filepath: str | None = None,
+                      sheet: str = "HTB2",
                       version: str = "MU") -> dict:
     """
     Charge les paramètres TURPE depuis TURPE_france.xlsx.
 
     Paramètres :
-    -----------
-    turpe_filepath : str
-        Chemin vers TURPE_france.xlsx. Si None, cherche dans database/ puis dans
-        le même dossier que ce script.
-    sheet : str
-        "HTB1", "HTB2" ou "HTB3" selon la tension de raccordement du client.
-    version : str
-        "CU" (courte utilisation), "MU" (moyenne), "LU" (longue utilisation).
+        turpe_filepath : chemin vers TURPE_france.xlsx (auto-détecté si None)
+        sheet          : "HTB1" | "HTB2" | "HTB3" selon tension de raccordement
+        version        : "CU" | "MU" | "LU" (courte / moyenne / longue utilisation)
 
     Retourne un dict avec les clés attendues par process_france_grid_data().
     """
-    import os as _os
-    if turpe_filepath is None:
-        # Chercher automatiquement
-        _here = _os.path.dirname(_os.path.abspath(__file__))
-        candidates = [
-            _os.path.join(_here, "database", "TURPE_france.xlsx"),
-            _os.path.join(_here, "TURPE_france.xlsx"),
-            "database/TURPE_france.xlsx",
-            "TURPE_france.xlsx",
-        ]
-        for c in candidates:
-            if _os.path.exists(c):
-                turpe_filepath = c
-                break
-
-    # Valeurs de fallback (TURPE 6 HTB2 MU Nov 2024)
-    fallback = {
-        "contract_fee_eur_kw_year": 7.1,
-        "HPTE": 11.444, "HPSH": 8.924, "HCSH": 6.824,
-        "HPSB": 5.354,  "HCSB": 3.570,
-        # Alias HP/HC pour compatibilité ancienne version
-        "HPH": 8.924, "HCH": 6.824, "HPE": 5.354, "HCE": 3.570,
-        "ticfe": 0.5, "cta": 0.3,
-        "gestion_eur_an": 9873.3,
-    }
-
-    if turpe_filepath is None or not _os.path.exists(turpe_filepath):
-        print(f"[TURPE] Fichier non trouvé — valeurs TURPE 6 HTB2 MU Nov 2024 par défaut")
-        return fallback
+    found = _find_turpe_file(turpe_filepath)
+    if not found:
+        print("[TURPE] Fichier non trouvé — valeurs TURPE 6 HTB2 MU Nov 2024 par défaut")
+        return _TURPE_DEFAULTS.copy()
 
     try:
-        df = pd.read_excel(turpe_filepath, sheet_name=sheet, header=None)
+        df = pd.read_excel(found, sheet_name=sheet, header=None)
 
         if sheet == "HTB3":
-            # HTB3 : tarif unique sans différenciation temporelle
-            # Chercher la ligne avec "Soutirage énergie"
-            for i, row in df.iterrows():
+            for _, row in df.iterrows():
                 if "soutirage" in str(row.iloc[0]).lower():
-                    # Prendre la valeur Nov 2024 (col 2) en c€/kWh → ×10 pour €/MWh
-                    val_mwh = float(row.iloc[2]) * 10
-                    return {
-                        "contract_fee_eur_kw_year": 0.0,  # HTB3 : pas de composante puissance
-                        "HPTE": val_mwh, "HPSH": val_mwh, "HCSH": val_mwh,
-                        "HPSB": val_mwh, "HCSB": val_mwh,
-                        "HPH": val_mwh, "HCH": val_mwh, "HPE": val_mwh, "HCE": val_mwh,
-                        "ticfe": 0.5, "cta": 0.3, "gestion_eur_an": 9873.3,
-                    }
-        else:
-            # HTB1 / HTB2 : trouver la colonne de la version (CU/MU/LU) Nov 2024
-            # Chercher la ligne d'en-tête avec "b (€/kW/an)"
-            header_row = None
-            version_col_b = None
-            version_col_c = None
+                    val = float(row.iloc[2]) * 10   # c€/kWh → €/MWh
+                    d = _TURPE_DEFAULTS.copy()
+                    d.update({k: val for k in ["HPSH","HCSH","HPSB","HCSB","HPTE",
+                                                "HPH","HCH","HPE","HCE"]})
+                    d["contract_fee_eur_kw_year"] = 0.0
+                    print(f"[TURPE] {sheet} chargé → {val:.2f} €/MWh")
+                    return d
 
-            for i, row in df.iterrows():
-                if "b (€/kW/an)" in str(row.values):
-                    header_row = i
-                    # Trouver la colonne de la version Nov 2024
-                    # L'ordre est CU-2021, CU-Nov2024, MU-2021, MU-Nov2024, LU-2021, LU-Nov2024
-                    ver_map = {"CU": (2, 3), "MU": (6, 7), "LU": (10, 11)}
-                    version_col_b, version_col_c = ver_map.get(version, (6, 7))
-                    break
+        # HTB1 / HTB2 : trouver la section version (CU/MU/LU) Nov 2024
+        ver_cols = {"CU": (2, 3), "MU": (6, 7), "LU": (10, 11)}
+        b_col, c_col = ver_cols.get(version, (6, 7))
 
-            if header_row is not None:
-                # Classes dans l'ordre : HPTE, HPSH, HCSH, HPSB, HCSB
-                classes = ["HPTE", "HPSH", "HCSH", "HPSB", "HCSB"]
-                params = {}
-                data_rows = df.iloc[header_row+1:header_row+6].reset_index(drop=True)
+        for i, row in df.iterrows():
+            if "b (€/kW/an)" in str(row.values):
+                data = df.iloc[i+1:i+6].reset_index(drop=True)
+                classes = ["HPTE","HPSH","HCSH","HPSB","HCSB"]
+                params = _TURPE_DEFAULTS.copy()
                 for idx, cls in enumerate(classes):
-                    if idx < len(data_rows):
-                        b = float(data_rows.iloc[idx, version_col_b])   # €/kW/an
-                        c = float(data_rows.iloc[idx, version_col_c]) * 10  # c€/kWh → €/MWh
-                        params[cls] = c
-
-                # contract_fee = b moyen pondéré (on prend HPSH comme référence MU)
-                b_ref = float(data_rows.iloc[1, version_col_b])
-
-                # Lire gestion annuelle depuis onglet contract
+                    if idx < len(data):
+                        try:
+                            params[cls] = float(data.iloc[idx, c_col]) * 10
+                        except (ValueError, IndexError):
+                            pass
+                # Lire la composante puissance depuis onglet contract
                 try:
-                    contract_df = pd.read_excel(turpe_filepath, sheet_name="contract", header=None)
-                    for _, row in contract_df.iterrows():
-                        if str(row.iloc[0]).strip().upper() == sheet.upper():
-                            b_ref = float(row.iloc[1])
-                            break
+                    cdf = pd.read_excel(found, sheet_name="contract", index_col=0)
+                    params["contract_fee_eur_kw_year"] = float(cdf.loc[sheet, "fees"])
                 except Exception:
-                    pass
-
+                    params["contract_fee_eur_kw_year"] = float(data.iloc[1, b_col])
                 # Alias HP/HC
-                params.update({
-                    "contract_fee_eur_kw_year": b_ref,
-                    "HPH": params.get("HPSH", fallback["HPH"]),
-                    "HCH": params.get("HCSH", fallback["HCH"]),
-                    "HPE": params.get("HPSB", fallback["HPE"]),
-                    "HCE": params.get("HCSB", fallback["HCE"]),
-                    "ticfe": 0.5, "cta": 0.3, "gestion_eur_an": 9873.3,
-                })
-                print(f"[TURPE] Chargé depuis {turpe_filepath} — {sheet} {version} Nov 2024")
+                params.update(HPH=params["HPSH"], HCH=params["HCSH"],
+                               HPE=params["HPSB"], HCE=params["HCSB"])
+                print(f"[TURPE] Chargé {found} — {sheet} {version} "
+                      f"| HPSH={params['HPSH']:.2f} HCSH={params['HCSH']:.2f} €/MWh")
                 return params
 
     except Exception as e:
-        print(f"[TURPE] Erreur lecture {turpe_filepath} : {e} — valeurs par défaut")
+        print(f"[TURPE] Erreur lecture {found} : {e} → valeurs par défaut")
 
+    return _TURPE_DEFAULTS.copy()
+
+
+def load_turpe_timezone(turpe_filepath: str | None = None) -> pd.DataFrame:
+    """
+    Charge la grille HP/HC par heure x mois depuis l'onglet 'timezone'.
+    Retourne DataFrame (index=heure 0-23, colonnes=Jan..Dec, valeurs='HP'|'HC').
+    """
+    found = _find_turpe_file(turpe_filepath)
+    fallback = pd.DataFrame(
+        {m: ["HC" if (h < 6 or h >= 22) else "HP" for h in range(24)]
+         for m in _MONTHS_ABR},
+        index=range(24)
+    )
+    if not found:
+        return fallback
+    try:
+        df = pd.read_excel(found, sheet_name="timezone", header=None)
+        # Ligne d'en-tête contient "hours" ou "heure"
+        for i, row in df.iterrows():
+            if str(row.iloc[0]).strip().lower() in ("hours", "heure", "heures"):
+                df.columns = [str(v).strip() for v in df.iloc[i]]
+                df = df.iloc[i+1:].reset_index(drop=True)
+                h_col = df.columns[0]
+                df[h_col] = pd.to_numeric(df[h_col], errors="coerce")
+                df = df.dropna(subset=[h_col]).astype({h_col: int})
+                df = df.set_index(h_col)
+                cols = [c for c in _MONTHS_ABR if c in df.columns]
+                return df[cols]
+    except Exception as e:
+        print(f"[TURPE] timezone non chargé : {e}")
     return fallback
 
 
-def process_france_grid_data(year: int, epex_filepath: str = None,
-                              turpe_filepath: str = None,
-                              turpe_sheet: str = "HTB2",
-                              turpe_version: str = "MU",
-                              turpe_params: dict = None) -> tuple:
+def load_turpe_season(turpe_filepath: str | None = None) -> dict:
     """
-    Construit le profil horaire du coût d'électricité réseau pour un industriel français HTB.
-
-    Logique économique :
-    - Le coût total = Prix EPEX Spot (énergie) + TURPE HTB (acheminement)
-    - Le TURPE HTB a une composante "puissance" (€/kW/an) et une composante "énergie" (€/MWh)
-    - En France il n'y a pas de tarification TOU aussi structurée qu'en Corée,
-      mais on distingue les heures HPH/HCH/HPE/HCE/HC-EJP selon le contrat.
-    - Pour simplifier et rester fidèle à la structure du code original,
-      on retourne un DataFrame horaire avec colonne 'rate' en €/MWh
-      et un contract_fee en €/kW/an (équivalent du contract_fee KEPCO).
-
-    Paramètres :
-    -----------
-    year : int
-        Année de modélisation (ex: 2030)
-    epex_filepath : str, optional
-        Chemin vers un CSV EPEX Spot téléchargé depuis ODRE.
-        Si None, utilise des valeurs moyennes de référence.
-    turpe_params : dict, optional
-        Paramètres TURPE HTB personnalisés. Si None, utilise les valeurs 2024 CRE.
-
-    Retourne :
-    ----------
-    temporal_df : pd.DataFrame
-        DataFrame indexé par datetime avec colonnes 'rate' (€/MWh) et 'contract_fee' (€/MWh)
-    contract_fee : float
-        Composante puissance du TURPE annualisée en €/kW/an
-    """
-
-    # ---- Paramètres TURPE HTB par défaut (CRE 2024, HTB2 - 63kV) ----
-    # Source : https://www.cre.fr/Electricite/Reseaux-d-electricite/Tarifs-d-acces
-    # Le TURPE HTB2 pour un industriel grand compte (>50 MW) :
-    #   - Composante de soutirage annuelle (CS) : ~7.5 €/kW/an (puissance souscrite)
-    #   - Composante d'énergie en HPH : ~5.2 €/MWh
-    #   - Composante d'énergie en HCH : ~1.8 €/MWh
-    #   - Composante d'énergie en HPE/HCE : ~0.5-1.0 €/MWh
-    # Note : Ces valeurs évoluent chaque année. Toujours vérifier sur cre.fr.
-
-    if turpe_params is None:
-        turpe_params = load_turpe_params(turpe_filepath, sheet=turpe_sheet, version=turpe_version)
-
-    contract_fee = turpe_params["contract_fee_eur_kw_year"]
-
-    # ---- Génération du profil horaire ----
-    date_range = pd.date_range(start=f"{year}-01-01", end=f"{year}-12-31 23:00", freq="h")
-
-    # Chargement ou simulation du prix EPEX Spot
-    if epex_filepath and os.path.exists(epex_filepath):
-        epex_df = _load_epex_from_csv(epex_filepath, year)
-    else:
-        # Profil EPEX Spot synthétique basé sur les moyennes historiques françaises
-        # Source : RTE eco2mix historique 2022-2024
-        # Prix moyen ~80 €/MWh avec variation saisonnière et heure de pointe
-        print("[INFO] Aucun fichier EPEX Spot fourni. Utilisation d'un profil synthétique.")
-        print("[INFO] Téléchargez les données réelles sur : https://odre.opendatasoft.com")
-        epex_df = _generate_synthetic_epex_profile(year, base_price_eur_mwh=80.0)
-
-    # Calcul du TURPE énergie selon les heures
-    turpe_energy = _compute_turpe_energy_by_hour(date_range, turpe_params, year, turpe_filepath)
-
-    # Assemblage du DataFrame temporel
-    temporal_df = pd.DataFrame(index=date_range)
-    temporal_df.index.name = "datetime"
-    temporal_df["epex_spot"] = epex_df.reindex(date_range).fillna(method="ffill")
-    temporal_df["turpe_energy"] = turpe_energy
-    temporal_df["ticfe"] = turpe_params["ticfe"]
-    temporal_df["cta"] = turpe_params["cta"]
-
-    # Taux total = prix énergie + TURPE énergie + taxes
-    temporal_df["rate"] = (
-        temporal_df["epex_spot"]
-        + temporal_df["turpe_energy"]
-        + temporal_df["ticfe"]
-        + temporal_df["cta"]
-    )
-
-    # Répartir la composante puissance du TURPE sur les heures (pour être comparable au code coréen)
-    hours_in_year = len(date_range)
-    temporal_df["contract_fee"] = (contract_fee * 1000) / hours_in_year  # converti en €/MWh·h
-
-    return temporal_df, contract_fee
-
-
-def _load_epex_from_csv(filepath: str, year: int) -> pd.Series:
-    """
-    Charge les prix EPEX Spot Day-Ahead depuis un CSV téléchargé sur ODRE.
-
-    Format attendu du CSV ODRE :
-    Colonnes : "Horodate", "Prix spot France (€/MWh)"
-    URL : https://odre.opendatasoft.com/explore/dataset/prix-spot-da-horaires/
-
-    Instructions de téléchargement :
-    1. Aller sur https://odre.opendatasoft.com
-    2. Rechercher "Prix spot Day-Ahead"
-    3. Filtrer par année
-    4. Exporter en CSV
-    """
-    df = pd.read_csv(filepath, sep=";", parse_dates=["Horodate"])
-    df = df.set_index("Horodate")
-    df = df[df.index.year == year]
-    price_col = [c for c in df.columns if "prix" in c.lower() or "price" in c.lower()][0]
-    return df[price_col].rename("epex_spot")
-
-
-def _generate_synthetic_epex_profile(year: int, base_price_eur_mwh: float = 80.0) -> pd.Series:
-    """
-    Génère un profil EPEX Spot synthétique représentatif du marché français.
-
-    Logique économique :
-    - Prix moyen annuel de base (paramètre)
-    - Surcôut hivernal (pic de demande de chauffage)
-    - Pic de midi (production solaire réduit les prix en été)
-    - Variation nuit/jour (courbe de charge industrielle)
-    """
-    date_range = pd.date_range(start=f"{year}-01-01", end=f"{year}-12-31 23:00", freq="h")
-    n = len(date_range)
-
-    # Composante de base
-    prices = np.full(n, base_price_eur_mwh)
-
-    months = date_range.month
-    hours = date_range.hour
-
-    # Saisonnalité : hiver +30%, été -10% (duck curve solaire)
-    seasonal = np.where(months.isin([12, 1, 2]), 1.30,
-               np.where(months.isin([6, 7, 8]), 0.90, 1.0))
-    prices *= seasonal
-
-    # Variation horaire : pointe matin (8h-10h) et soir (18h-20h), creux nuit et midi en été
-    hour_factor = np.ones(n)
-    is_summer = months.isin([5, 6, 7, 8, 9])
-    is_winter = ~is_summer
-
-    # Pointe matin/soir en hiver
-    hour_factor = np.where(is_winter & hours.isin([8, 9, 10]), 1.20, hour_factor)
-    hour_factor = np.where(is_winter & hours.isin([18, 19, 20]), 1.25, hour_factor)
-    hour_factor = np.where(is_winter & hours.isin([0, 1, 2, 3, 4]), 0.75, hour_factor)
-
-    # Duck curve en été : creux midi (solaire), pointe soir
-    hour_factor = np.where(is_summer & hours.isin([11, 12, 13, 14]), 0.80, hour_factor)
-    hour_factor = np.where(is_summer & hours.isin([19, 20, 21]), 1.15, hour_factor)
-
-    prices *= hour_factor
-
-    # Bruit aléatoire réaliste (volatilité de marché)
-    np.random.seed(42)
-    prices *= np.random.lognormal(0, 0.10, n)
-
-    return pd.Series(prices, index=date_range, name="epex_spot")
-
-
-def load_turpe_timezone(turpe_filepath: str = None) -> pd.DataFrame:
-    """
-    Charge la grille horaire HP/HC par mois depuis TURPE_france.xlsx onglet 'timezone'.
-    Retourne un DataFrame (24 lignes × 12 colonnes mois) avec valeurs 'HP' ou 'HC'.
-    """
-    import os as _os
-    if turpe_filepath is None:
-        _here = _os.path.dirname(_os.path.abspath(__file__))
-        for c in [_os.path.join(_here, "database", "TURPE_france.xlsx"),
-                  _os.path.join(_here, "TURPE_france.xlsx"),
-                  "database/TURPE_france.xlsx"]:
-            if _os.path.exists(c):
-                turpe_filepath = c
-                break
-
-    if turpe_filepath and _os.path.exists(turpe_filepath):
-        try:
-            df = pd.read_excel(turpe_filepath, sheet_name="timezone", header=None)
-            # Trouver la ligne avec "heure" comme en-tête
-            for i, row in df.iterrows():
-                if str(row.iloc[0]).strip().lower() == "heure":
-                    header_idx = i
-                    break
-            else:
-                raise ValueError("En-tête 'heure' non trouvé")
-            df.columns = df.iloc[header_idx]
-            df = df.iloc[header_idx+1:].reset_index(drop=True)
-            df = df[df["heure"].apply(lambda x: str(x).strip().isdigit())]
-            df["heure"] = df["heure"].astype(int)
-            df = df.set_index("heure")
-            # Garder uniquement les colonnes mois (Jan..Dec)
-            mois_cols = ["Jan","Feb","Mar","Apr","May","Jun",
-                         "Jul","Aug","Sep","Oct","Nov","Dec"]
-            df = df[[c for c in mois_cols if c in df.columns]]
-            return df
-        except Exception as e:
-            print(f"[TURPE] timezone non chargé : {e}")
-
-    # Fallback : TURPE 6 HTB — HP=8h-20h semaine, HC=reste
-    rows = {}
-    for h in range(24):
-        hp = "HP" if 8 <= h < 20 else "HC"
-        rows[h] = {m: hp for m in ["Jan","Feb","Mar","Apr","May","Jun",
-                                    "Jul","Aug","Sep","Oct","Nov","Dec"]}
-    return pd.DataFrame(rows).T
-
-
-def load_turpe_season(turpe_filepath: str = None) -> dict:
-    """
-    Charge le mapping mois→saison depuis TURPE_france.xlsx onglet 'season'.
+    Charge le mapping mois → saison depuis l'onglet 'season'.
     Retourne dict {mois_abrégé: 'Haute'|'Basse'}.
     """
-    import os as _os
-    if turpe_filepath is None:
-        _here = _os.path.dirname(_os.path.abspath(__file__))
-        for c in [_os.path.join(_here, "database", "TURPE_france.xlsx"),
-                  _os.path.join(_here, "TURPE_france.xlsx"),
-                  "database/TURPE_france.xlsx"]:
-            if _os.path.exists(c):
-                turpe_filepath = c
-                break
-
-    fallback = {
-        "Jan": "Haute", "Feb": "Haute", "Mar": "Haute",
-        "Apr": "Basse", "May": "Basse", "Jun": "Basse",
-        "Jul": "Basse", "Aug": "Basse", "Sep": "Basse",
-        "Oct": "Basse", "Nov": "Haute", "Dec": "Haute",
-    }
-    if turpe_filepath and _os.path.exists(turpe_filepath):
-        try:
-            df = pd.read_excel(turpe_filepath, sheet_name="season", header=None)
-            for i, row in df.iterrows():
-                if str(row.iloc[0]).strip().lower() == "mois":
-                    header_idx = i
-                    break
-            else:
-                return fallback
-            df.columns = df.iloc[header_idx]
-            df = df.iloc[header_idx+1:].reset_index(drop=True)
-            df = df.dropna(subset=["Mois"])
-            return dict(zip(df["Mois"].astype(str).str.strip(),
-                            df["Saison"].astype(str).str.strip()))
-        except Exception as e:
-            print(f"[TURPE] season non chargé : {e}")
-    return fallback
+    found = _find_turpe_file(turpe_filepath)
+    if not found:
+        return _SEASON_DEFAULT.copy()
+    try:
+        df = pd.read_excel(found, sheet_name="season", header=None)
+        for i, row in df.iterrows():
+            lbl = str(row.iloc[0]).strip().lower()
+            if lbl in ("month", "mois"):
+                df.columns = [str(v).strip() for v in df.iloc[i]]
+                df = df.iloc[i+1:].dropna().reset_index(drop=True)
+                c_m = [c for c in df.columns if "mois" in c.lower() or "month" in c.lower()][0]
+                c_s = [c for c in df.columns if "saison" in c.lower() or "season" in c.lower()][0]
+                return dict(zip(df[c_m].str.strip(), df[c_s].str.strip()))
+    except Exception as e:
+        print(f"[TURPE] season non chargé : {e}")
+    return _SEASON_DEFAULT.copy()
 
 
-def _compute_turpe_energy_by_hour(date_range: pd.DatetimeIndex,
-                                   turpe_params: dict, year: int,
-                                   turpe_filepath: str = None) -> pd.Series:
+def _compute_turpe_energy_hourly(dr: pd.DatetimeIndex,
+                                  params: dict,
+                                  turpe_filepath: str | None = None) -> np.ndarray:
     """
-    Calcule la composante énergie du TURPE HTB par heure.
-    Utilise la grille HP/HC et le mapping saisonnier de TURPE_france.xlsx.
-
-    Classes TURPE 6 HTB2 :
-      HPTE = Heures Pleines Très Hautes Eaux (pas en France standard)
-      HPSH = HP Saison Haute
-      HCSH = HC Saison Haute
-      HPSB = HP Saison Basse
-      HCSB = HC Saison Basse
+    Calcule la composante énergie TURPE HTB pour chaque heure du DatetimeIndex.
+    Utilise grille HP/HC + mapping saisonnier depuis TURPE_france.xlsx.
+    Week-end → toujours HC (pas de pointe facturée sur les jours non ouvrés).
     """
-    tz_grid  = load_turpe_timezone(turpe_filepath)
-    season_map = load_turpe_season(turpe_filepath)
+    tz     = load_turpe_timezone(turpe_filepath)
+    season = load_turpe_season(turpe_filepath)
+    out    = np.zeros(len(dr))
 
-    month_abbr = ["Jan","Feb","Mar","Apr","May","Jun",
-                  "Jul","Aug","Sep","Oct","Nov","Dec"]
-
-    months   = date_range.month
-    hours    = date_range.hour
-    weekdays = date_range.weekday  # 0=lundi, 6=dimanche
-
-    turpe_energy = np.zeros(len(date_range))
-
-    for i, (m, h, wd) in enumerate(zip(months, hours, weekdays)):
-        mois_str = month_abbr[m - 1]
-        season = season_map.get(mois_str, "Basse")
-        is_hp_day = wd < 5  # lundi-vendredi
-
-        # Lire HP/HC depuis la grille
+    for i, ts in enumerate(dr):
+        m      = _MONTHS_ABR[ts.month - 1]
+        s      = season.get(m, "Basse")
+        is_we  = ts.weekday() >= 5
         try:
-            hp_hc = tz_grid.loc[h, mois_str] if mois_str in tz_grid.columns else ("HP" if 8 <= h < 20 else "HC")
-        except Exception:
-            hp_hc = "HP" if 8 <= h < 20 else "HC"
-
-        # week-end/JF → toujours HC
-        if not is_hp_day:
+            hp_hc = tz.loc[ts.hour, m]
+        except (KeyError, TypeError):
+            hp_hc = "HP" if 8 <= ts.hour < 20 else "HC"
+        if is_we:
             hp_hc = "HC"
 
-        # Mapper vers la clé TURPE
-        if season == "Haute" and hp_hc == "HP":
-            key = "HPSH"
-        elif season == "Haute" and hp_hc == "HC":
-            key = "HCSH"
-        elif season == "Basse" and hp_hc == "HP":
-            key = "HPSB"
+        if s == "Haute" and hp_hc == "HP":
+            out[i] = params.get("HPSH", params.get("HPH", 8.9))
+        elif s == "Haute":
+            out[i] = params.get("HCSH", params.get("HCH", 6.8))
+        elif hp_hc == "HP":
+            out[i] = params.get("HPSB", params.get("HPE", 5.4))
         else:
-            key = "HCSB"
-
-        turpe_energy[i] = turpe_params.get(key, turpe_params.get("HPH", 5.0))
-
-    return pd.Series(turpe_energy, index=date_range)
+            out[i] = params.get("HCSB", params.get("HCE", 3.6))
+    return out
 
 
-# ============================================================
-# 2. REMPLACEMENT DE multiyear_pricing()
-#    → multiyear_pricing_france()
-# ============================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. PROFIL DE COÛT RÉSEAU — process_france_grid_data()
+# ─────────────────────────────────────────────────────────────────────────────
 
-def multiyear_pricing_france(temporal_df: pd.DataFrame, contract_fee: float,
-                              start_year: int, num_years: int,
-                              rate_increase: float,
-                              annualised_contract: bool = True) -> tuple:
+def process_france_grid_data(
+    year: int,
+    epex_filepath: str | None = None,
+    turpe_filepath: str | None = None,
+    turpe_sheet: str = "HTB2",
+    turpe_version: str = "MU",
+    turpe_params: dict | None = None,
+    epex_db_year: int | None = None,
+) -> tuple[pd.DataFrame, float]:
     """
-    Projection multi-annuelle des tarifs électricité français.
+    Construit le profil horaire du coût électricité réseau pour un industriel HTB.
 
-    Logique économique :
-    - Le TURPE est revu chaque année par la CRE (hausse moyenne ~4-6%/an depuis 2020)
-    - Le prix EPEX Spot évolue selon le marché (très volatil — on utilise une tendance)
-    - On applique le même mécanisme d'escalade que dans le code coréen original.
+    Coût total = EPEX Spot Day-Ahead + TURPE énergie + TICFE + CTA
 
-    IMPORTANT sur le taux d'escalade pour la France :
-    - Historiquement TURPE : +4-6%/an
-    - Prix de marché : très variable, hypothèse centrale +2-3%/an en termes réels
-    - La valeur rate_increase couvre les deux composantes de façon simplifiée.
+    Paramètres :
+        year          : année de modélisation
+        epex_filepath : CSV EPEX ODRE (optionnel — si absent, utilise epex_profiles.db)
+        turpe_filepath: TURPE_france.xlsx (auto-détecté si None)
+        turpe_sheet   : "HTB1" | "HTB2" | "HTB3"
+        turpe_version : "CU" | "MU" | "LU"
+        turpe_params  : dict de paramètres TURPE (remplace le chargement fichier si fourni)
+        epex_db_year  : année du profil EPEX dans epex_profiles.db (défaut = year)
+
+    Retourne :
+        temporal_df   : DataFrame horaire avec colonnes
+                        [epex_spot, turpe_energy, ticfe, cta, rate, contract_fee]
+        contract_fee  : composante puissance TURPE annualisée (€/kW/an)
     """
-    # Identique à la logique coréenne — la structure est universelle
-    all_years_df = []
-    preset_df = temporal_df.copy()
-    preset_df.index = preset_df.index.strftime("%m-%d %H:%M")
+    if turpe_params is None:
+        turpe_params = load_turpe_params(turpe_filepath, turpe_sheet, turpe_version)
+    contract_fee = turpe_params["contract_fee_eur_kw_year"]
 
-    # Ajout du 29 février si nécessaire
-    if not any(preset_df.index.str.startswith("02-29")):
-        feb_28 = preset_df.loc["02-28 00:00":"02-28 23:00"].copy()
-        feb_29 = feb_28.copy()
-        feb_29.index = feb_29.index.str.replace("02-28", "02-29")
-        preset_df = pd.concat([preset_df, feb_29])
+    dr = pd.date_range(f"{year}-01-01", f"{year}-12-31 23:00", freq="h")
 
-    contract_fees = []
+    # ── Chargement du profil EPEX ─────────────────────────────────────────────
+    epex = _load_epex_profile(year, epex_filepath, epex_db_year)
 
-    for year in range(start_year, start_year + num_years):
-        date_range = pd.date_range(start=f"{year}-01-01", end=f"{year}-12-31 23:00", freq="h")
-        current_df = pd.DataFrame(index=date_range, columns=temporal_df.columns)
-        current_df.index = current_df.index.strftime("%m-%d %H:%M")
-        matching = current_df.index.intersection(preset_df.index)
-        current_df.loc[matching] = preset_df.loc[matching].values
+    # ── TURPE énergie horaire ─────────────────────────────────────────────────
+    turpe_e = _compute_turpe_energy_hourly(dr, turpe_params, turpe_filepath)
 
-        escalation = (1 + rate_increase) ** (year - start_year)
-        current_df["rate"] = current_df["rate"] * escalation
+    # ── Assemblage ────────────────────────────────────────────────────────────
+    df = pd.DataFrame(index=dr)
+    df.index.name = "datetime"
+    df["epex_spot"]    = epex.reindex(dr).fillna(method="ffill").fillna(method="bfill")
+    df["turpe_energy"] = turpe_e
+    df["ticfe"]        = turpe_params.get("ticfe", 0.5)
+    df["cta"]          = turpe_params.get("cta",   0.3)
+    df["rate"]         = df["epex_spot"] + df["turpe_energy"] + df["ticfe"] + df["cta"]
+    # Composante puissance ramenée à l'heure (en €/MWh·h pour la cohérence avec le code)
+    df["contract_fee"] = (contract_fee * 1000) / len(dr)
 
-        current_df.index = date_range
-        year_contract_fee = contract_fee * escalation
-        contract_fees.append({"year": year, "rate": year_contract_fee})
+    return df, contract_fee
 
+
+def _load_epex_profile(year: int,
+                        csv_path: str | None = None,
+                        db_year: int | None = None) -> pd.Series:
+    """
+    Charge le profil EPEX horaire depuis :
+      1. CSV ODRE fourni explicitement
+      2. epex_profiles.db (cache SQLite)
+      3. Profil synthétique de fallback
+    """
+    # CSV explicite
+    if csv_path and os.path.exists(csv_path):
+        s = _parse_epex_odre_csv(csv_path, year)
+        if s is not None:
+            return s
+
+    # Base de données cache
+    db = _DB_DIR / "epex_profiles.db"
+    ref_year = db_year or year
+    s = _read_sqlite_series(db, f"epex_{ref_year}", "datetime", "price_eur_mwh")
+    if s is not None and len(s) >= 8700:
+        dr = pd.date_range(f"{year}-01-01", f"{year}-12-31 23:00", freq="h")
+        # Réindexer sur l'année demandée (même profil horaire, autre année)
+        if s.index.year[0] != year:
+            s.index = dr[:len(s)]
+        return s.reindex(dr).fillna(method="ffill").fillna(method="bfill")
+
+    # Fallback synthétique
+    print(f"[WARN] EPEX {year} non trouvé en cache — profil synthétique")
+    return _synthetic_epex_fallback(year)
+
+
+def _parse_epex_odre_csv(path: str, year: int) -> pd.Series | None:
+    """Parse un CSV EPEX ODRE (sep=';', dec=',')."""
+    try:
+        df = pd.read_csv(path, sep=";", decimal=",", encoding="utf-8-sig")
+        df.columns = df.columns.str.strip()
+        date_col  = next((c for c in df.columns if "date" in c.lower()), None)
+        hour_col  = next((c for c in df.columns if "heure" in c.lower()), None)
+        price_col = next((c for c in df.columns
+                          if "france" in c.lower() or "prix" in c.lower()), None)
+        if not all([date_col, hour_col, price_col]):
+            return None
+        df["dt"] = pd.to_datetime(df[date_col] + " " + df[hour_col],
+                                   format="%d/%m/%Y %H:%M", errors="coerce")
+        df = df.dropna(subset=["dt"])
+        df = df[df["dt"].dt.year == year].copy()
+        df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
+        s = df.set_index("dt")[price_col].rename("price_eur_mwh")
+        s = s.resample("h").mean()
+        dr = pd.date_range(f"{year}-01-01", f"{year}-12-31 23:00", freq="h")
+        return s.reindex(dr).interpolate("time").ffill().bfill()
+    except Exception as e:
+        print(f"[WARN] Parsing EPEX CSV : {e}")
+        return None
+
+
+def _synthetic_epex_fallback(year: int, base: float = 65.0) -> pd.Series:
+    """Profil EPEX synthétique minimal (pour éviter les crashs)."""
+    dr = pd.date_range(f"{year}-01-01", f"{year}-12-31 23:00", freq="h")
+    n  = len(dr)
+    h  = dr.hour.values
+    seasonal = 1.0 + 0.30 * np.cos(2 * np.pi * np.arange(n) / 8760)
+    daily    = 1.0 + 0.20 * np.sin(2 * np.pi * (h - 6) / 24)
+    rng      = np.random.default_rng(year)
+    prices   = base * seasonal * daily * rng.lognormal(0, 0.10, n)
+    return pd.Series(prices.round(2), index=dr, name="price_eur_mwh")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. PROJECTION MULTI-ANNUELLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def multiyear_pricing_france(
+    temporal_df: pd.DataFrame,
+    contract_fee: float,
+    start_year: int,
+    num_years: int,
+    rate_increase: float,
+    annualised_contract: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Projection multi-annuelle des tarifs réseau français.
+
+    Le taux rate_increase couvre l'escalade combinée :
+      - TURPE : historiquement +4-6%/an depuis 2020 (source CRE)
+      - EPEX  : hypothèse +2-3%/an réel (très volatile — approximation)
+    Recommandation : utiliser rate_increase ∈ [0.02, 0.04] pour les scénarios centraux.
+
+    Retourne :
+        long_df      : DataFrame horaire sur num_years années
+        contract_df  : DataFrame annuel avec la composante puissance escaladée
+    """
+    all_dfs        = []
+    contract_rows  = []
+    preset         = temporal_df.copy()
+    preset.index   = preset.index.strftime("%m-%d %H:%M")
+
+    # Ajouter le 29 février pour les années bissextiles
+    feb28 = preset.loc[preset.index.str.startswith("02-28")]
+    feb29 = feb28.copy()
+    feb29.index = feb29.index.str.replace("02-28", "02-29")
+    preset = pd.concat([preset, feb29])
+
+    for offset in range(num_years):
+        yr = start_year + offset
+        dr = pd.date_range(f"{yr}-01-01", f"{yr}-12-31 23:00", freq="h")
+        keys = dr.strftime("%m-%d %H:%M")
+
+        esc      = (1 + rate_increase) ** offset
+        year_df  = preset.reindex(keys).copy()
+        year_df.index = dr
+        year_df["rate"] = pd.to_numeric(year_df["rate"], errors="coerce") * esc
+
+        yr_cf = contract_fee * esc
         if annualised_contract:
-            hours_in_year = len(date_range)
-            current_df["contract_fee"] = year_contract_fee / hours_in_year
+            year_df["contract_fee"] = (yr_cf * 1000) / len(dr)
 
-        all_years_df.append(current_df)
+        all_dfs.append(year_df)
+        contract_rows.append({"year": yr, "rate": yr_cf})
 
-    long_df = pd.concat(all_years_df)
-    return long_df, pd.DataFrame(contract_fees)
+    return pd.concat(all_dfs), pd.DataFrame(contract_rows)
 
 
-# ============================================================
-# 3. REMPLACEMENT DE create_rec_grid()
-#    → create_go_grid() (Garanties d'Origine)
-# ============================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. GARANTIES D'ORIGINE
+# ─────────────────────────────────────────────────────────────────────────────
 
-def create_go_grid(start_year: int, end_year: int,
-                   initial_go_price_eur_mwh: float = 8.0,
-                   rate_increase: float = 0.0) -> pd.DataFrame:
+def create_go_grid(
+    start_year: int,
+    end_year: int,
+    initial_go_price_eur_mwh: float = 8.0,
+    rate_increase: float = 0.0,
+    go_type: str = "annual",
+) -> pd.DataFrame:
     """
     Génère la trajectoire de prix des Garanties d'Origine (GO) françaises.
 
-    Contexte économique :
-    - Les GO sont l'équivalent français des RECs coréens.
-    - Elles attestent qu'1 MWh a été produit à partir d'une source renouvelable.
-    - Prix marché en 2024 : ~5-15 €/MWh (source : EEX, AIB)
-    - Contrairement aux RECs coréens (80 000 KRW/MWh ≈ 57 €/MWh), les GO françaises
-      sont beaucoup moins chères car il y a déjà un fort % de nucléaire dans le mix.
-    - En France, les GOs sont souvent incluses dans les contrats PPA directement.
-
-    Sources pour le prix des GO :
-    - EEX : https://www.eex.com/en/market-data/environmental-markets
-    - AIB : https://www.aib-net.org/facts/residual-mix
-    - VERT : plateforme française de GO https://www.vertvertu.fr
+    Les GO sont l'équivalent français des RECs coréens, mais beaucoup moins chers
+    car le mix électrique français est déjà fortement décarboné (nucléaire ~70%).
 
     Paramètres :
-    -----------
-    initial_go_price_eur_mwh : float
-        Prix initial des GO en €/MWh. Par défaut 8 €/MWh (valeur 2024 approx.)
-        Note : Ce prix peut varier fortement selon la conjoncture.
+        initial_go_price_eur_mwh : prix initial (€/MWh). Valeurs 2024 :
+            annual matching  → 5-8 €/MWh
+            monthly matching → 8-12 €/MWh
+            hourly / 24-7 CFE → 12-20 €/MWh
+        rate_increase : évolution annuelle du prix GO (% décimal)
+        go_type       : "annual" | "monthly" | "hourly" (granularité du matching)
+
+    Sources :
+        EEX Environmental Markets : https://www.eex.com
+        AIB residual mix report   : https://www.aib-net.org
     """
-    go_values = {
-        year: initial_go_price_eur_mwh * (1 + rate_increase) ** (year - start_year)
-        for year in range(start_year, end_year + 1)
-    }
-    return pd.DataFrame({"value": go_values})
+    # Prime de granularité (plus le matching est fin, plus la GO est premium)
+    granularity_mult = {"annual": 1.0, "monthly": 1.4, "hourly": 2.2}
+    base = initial_go_price_eur_mwh * granularity_mult.get(go_type, 1.0)
 
-
-# ============================================================
-# 4. DONNÉES GRID.CSV → build_france_grid_info()
-# ============================================================
-
-def build_france_grid_info(start_year: int = 2023, end_year: int = 2050,
-                            eco2mix_filepath: str = None) -> pd.DataFrame:
-    """
-    Construit le fichier grid.csv équivalent pour la France.
-    Remplace le fichier database/grid.csv du projet coréen.
-
-    Colonnes produites (même format que l'original) :
-    - solar_capex  : CAPEX solaire en €/MW (source ADEME/IRENA)
-    - wind_capex   : CAPEX éolien offshore en €/MW
-    - co2          : Intensité carbone du réseau français en gCO2/kWh
-    - ren_share    : Part renouvelable dans le mix électrique français
-
-    Sources de données :
-    - CAPEX : ADEME "Futurs Énergétiques 2050", RTE Bilan Prévisionnel
-              https://www.rte-france.com/analyses-tendances-et-prospectives/bilan-previsionnel-2050-futurs-energetiques
-    - CO2 / ren_share : RTE eco2mix ODRE
-              https://odre.opendatasoft.com/explore/dataset/eco2mix-national-cons-def/
-
-    INSTRUCTIONS pour les données réelles :
-    ----------------------------------------
-    1. Télécharger eco2mix depuis ODRE :
-       URL : https://odre.opendatasoft.com/explore/dataset/eco2mix-national-cons-def/
-       → Filtrer par an, exporter en CSV
-       → Colonnes utiles : "taux_co2" (gCO2/kWh), "taux_enr" (%)
-
-    2. Pour les CAPEX, utiliser les trajectoires ADEME :
-       - Scénario M0 (100% ENR) ou S3 (mix) selon le client
-       - Valeurs typiques 2030 : PV sol ~650-750 k€/MW, éolien offshore ~2500-3000 k€/MW
-
-    Paramètres :
-    -----------
-    eco2mix_filepath : str, optional
-        Chemin vers un CSV eco2mix téléchargé depuis ODRE.
-        Si None, utilise des projections de référence RTE.
-    """
     years = range(start_year, end_year + 1)
+    values = {
+        y: base * (1 + rate_increase) ** (y - start_year)
+        for y in years
+    }
+    df = pd.DataFrame({"value": values})
+    df.index.name = "year"
+    return df
 
-    # --- CAPEX solaire (€/MW) ---
-    # Source : ADEME Futurs Énergétiques 2050, Annexe CAPEX
-    # Trajectoire de baisse : ~900 k€/MW en 2023 → ~500 k€/MW en 2050
-    solar_capex_2023 = 900_000   # €/MW
-    solar_capex_2050 = 500_000   # €/MW
-    solar_capex = np.linspace(solar_capex_2023, solar_capex_2050, len(years))
 
-    # --- CAPEX éolien offshore (€/MW) ---
-    # Source : RTE Bilan Prévisionnel 2023
-    # Trajectoire : ~3000 k€/MW en 2023 → ~1800 k€/MW en 2050
-    wind_capex_2023 = 3_000_000  # €/MW
-    wind_capex_2050 = 1_800_000  # €/MW
-    wind_capex = np.linspace(wind_capex_2023, wind_capex_2050, len(years))
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. MÉTRIQUES DE SITE — compute_site_metrics()
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # --- Intensité carbone (gCO2/kWh) ---
-    # La France a déjà une intensité très faible (~55 gCO2/kWh en 2023) grâce au nucléaire
-    # Trajectoire vers la neutralité : ~30 gCO2/kWh en 2050
-    # Source : RTE eco2mix, données historiques
-    co2_2023 = 55.0    # gCO2/kWh (France 2023, très bas vs Corée ~450 gCO2/kWh)
-    co2_2050 = 20.0
-    co2 = np.linspace(co2_2023, co2_2050, len(years))
+def compute_site_metrics(
+    site_col: str,
+    technology: str,
+    epex_year: int = 2020,
+    load_col: str = "siderurgie",
+    epex_csv: str | None = None,
+    db_dir: Path | None = None,
+) -> dict:
+    """
+    Calcule les métriques économiques et de corrélation d'un site candidat PPA.
 
-    # --- Part renouvelable (%) ---
-    # Source : RTE Futurs Énergétiques - scénario de référence
-    # France 2023 : ~29% ENR (hors nucléaire) | avec nucléaire ~93% décarboné
-    # Objectif 2030 : 40% ENR, 2050 : 100% ENR selon scénario M0
-    ren_2023 = 0.29
-    ren_2050 = 0.80   # Hypothèse conservatrice (vs 1.0 scénario M0)
-    ren_share = np.linspace(ren_2023, ren_2050, len(years))
+    Métriques retournées :
+        capture_rate_systeme  : CR = Σ(Q×spot) / (ΣQ × spot_moy)
+            > 1 → produit aux heures chères (éolien hivernal)
+            < 1 → cannibalisation (solaire aux heures creuses)
+        capture_price         : CR × spot_moyen (€/MWh)
+        cf_mean               : facteur de charge moyen (%)
+        correlation_load      : corrélation de Pearson profil×charge client
+        p50_annual_prod_mwh   : production P50 annuelle par MW installé (MWh/MW/an)
+        best_match_month      : mois avec le meilleur matching profil×charge
+        cannibalization_risk  : score 0-1 (1 = forte cannibalisation)
 
+    Paramètres :
+        site_col   : nom de la colonne dans solar_patterns.db ou wind_patterns.db
+        technology : "solar" | "offshore" | "onshore" | "hybrid"
+        epex_year  : année du profil EPEX de référence
+        load_col   : profil de charge client ("siderurgie" | "chimie" | "papier" | "agroalim")
+        epex_csv   : chemin CSV EPEX ODRE (optionnel)
+        db_dir     : répertoire database (défaut: auto-détecté)
+    """
+    ddir = db_dir or _DB_DIR
+
+    # ── Charger le profil de production ──────────────────────────────────────
+    db_name = "solar_patterns.db" if technology == "solar" else "wind_patterns.db"
+    prod_series = _read_sqlite_series(ddir / db_name,
+                                       "solar_patterns" if technology == "solar" else "wind_patterns",
+                                       "datetime", site_col)
+    if prod_series is None:
+        return {"error": f"Site '{site_col}' introuvable dans {db_name}"}
+
+    # ── Charger le profil EPEX ────────────────────────────────────────────────
+    epex = _load_epex_profile(epex_year, epex_csv)
+    common_idx = prod_series.index.intersection(epex.index)
+    if len(common_idx) < 8000:
+        return {"error": f"Index commun trop court ({len(common_idx)} heures)"}
+
+    Q    = prod_series.reindex(common_idx).fillna(0).values.astype(float)
+    spot = epex.reindex(common_idx).values.astype(float)
+
+    total_vol  = Q.sum()
+    spot_mean  = spot.mean()
+    if total_vol <= 0 or spot_mean <= 0:
+        return {"error": "Volume ou spot moyen nul"}
+
+    # ── Capture rate ─────────────────────────────────────────────────────────
+    capture_price = float((Q * spot).sum() / total_vol)
+    cr            = capture_price / spot_mean
+
+    # ── Facteur de charge ─────────────────────────────────────────────────────
+    cf_mean = float(Q.mean())
+
+    # ── P50 production annuelle (MWh/MW installé/an) ──────────────────────────
+    # On compte sur 8760h — fraction de l'année couverte = len/8760
+    p50_mwh_mw = float(Q.sum() / (len(Q) / 8760))
+
+    # ── Corrélation avec la charge client ────────────────────────────────────
+    load_db = ddir / "load_patterns.db"
+    load_s  = _read_sqlite_series(load_db, "load_patterns", "datetime", load_col)
+    corr = np.nan
+    if load_s is not None:
+        common_load = prod_series.index.intersection(load_s.index)
+        if len(common_load) >= 8000:
+            q_l = prod_series.reindex(common_load).fillna(0).values.astype(float)
+            l_l = load_s.reindex(common_load).fillna(0).values.astype(float)
+            if q_l.std() > 0 and l_l.std() > 0:
+                corr = float(np.corrcoef(q_l, l_l)[0, 1])
+
+    # ── Risque de cannibalisation ─────────────────────────────────────────────
+    # Heures où spot < 0 et Q > 0 (production pendant prix négatifs)
+    neg_prod_hours = int(((spot < 0) & (Q > 0.01)).sum())
+    neg_revenue    = float((Q * np.minimum(spot, 0)).sum())  # perte potentielle
+    cannibalization_risk = float(np.clip(neg_prod_hours / max(len(Q), 1) * 10, 0, 1))
+
+    # ── Meilleur mois de matching ─────────────────────────────────────────────
+    dr_common = pd.DatetimeIndex(common_idx)
+    monthly_q = pd.Series(Q, index=dr_common).resample("ME").mean()
+    best_month = int(monthly_q.idxmax().month) if len(monthly_q) > 0 else 0
+
+    return {
+        "site":                   site_col,
+        "technology":             technology,
+        "cf_mean":                round(cf_mean, 4),
+        "p50_mwh_per_mw_year":    round(p50_mwh_mw, 1),
+        "capture_rate_systeme":   round(cr, 4),
+        "capture_price_eur_mwh":  round(capture_price, 2),
+        "epex_spot_mean":         round(spot_mean, 2),
+        "correlation_load":       round(corr, 4) if not np.isnan(corr) else None,
+        "neg_prod_hours":         neg_prod_hours,
+        "neg_revenue_eur_per_mw": round(neg_revenue, 0),
+        "cannibalization_risk":   round(cannibalization_risk, 4),
+        "best_match_month":       best_month,
+        "epex_year":              epex_year,
+        "load_profile":           load_col,
+    }
+
+
+def compute_all_site_metrics(
+    epex_year: int = 2020,
+    load_col: str = "siderurgie",
+    epex_csv: str | None = None,
+    db_dir: Path | None = None,
+) -> pd.DataFrame:
+    """
+    Calcule les métriques pour tous les sites disponibles dans solar_patterns.db et wind_patterns.db.
+    Retourne un DataFrame trié par score composite (capture_rate × corrélation).
+    """
+    ddir = db_dir or _DB_DIR
+    results = []
+
+    # Sites solaires
+    sol_df = _read_sqlite_all(ddir / "solar_patterns.db", "solar_patterns", "datetime")
+    if sol_df is not None:
+        for col in sol_df.columns:
+            m = compute_site_metrics(col, "solar", epex_year, load_col, epex_csv, ddir)
+            if "error" not in m:
+                results.append(m)
+
+    # Sites éoliens
+    wind_df = _read_sqlite_all(ddir / "wind_patterns.db", "wind_patterns", "datetime")
+    if wind_df is not None:
+        # Déduire le type offshore/onshore depuis le nom de colonne
+        for col in wind_df.columns:
+            tech = "offshore" if "off" in col.lower() else "onshore"
+            m = compute_site_metrics(col, tech, epex_year, load_col, epex_csv, ddir)
+            if "error" not in m:
+                results.append(m)
+
+    if not results:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(results)
+    # Score composite : capture_rate × max(0, corrélation_load)
+    df["score_composite"] = (
+        df["capture_rate_systeme"] *
+        df["correlation_load"].clip(lower=0).fillna(0)
+    ).round(4)
+    return df.sort_values("score_composite", ascending=False).reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. CAPTURE PRICE EFFECTIVE — avec clauses curtailment / prix négatifs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_effective_capture_price(
+    prod_profile: pd.Series,
+    spot_profile: pd.Series,
+    neg_price_floor: float | None = 0.0,
+    curtailment_threshold: float | None = None,
+    grid_curtailment_rate: float = 0.0,
+    sleeving_fee: float = 0.0,
+    basis_risk: float = 0.0,
+) -> dict:
+    """
+    Calcule le capture price effectif après application des clauses contractuelles.
+
+    Le capture_price_standard mesure la valeur marchande de la production.
+    Le capture_price_effective reflète le revenu net réellement reçu par le producteur
+    après prise en compte des clauses de protection et des coûts.
+
+    Paramètres (correspondent aux paramètres de scenario_defaults.xlsx) :
+        neg_price_floor      : plancher de prix pour le settlement (€/MWh)
+                               0 = zero floor (standard 2024+)
+                               None = pas de protection
+        curtailment_threshold: seuil de curtailment volontaire (€/MWh)
+                               Si spot < seuil → production = 0
+                               None = pas de curtailment
+        grid_curtailment_rate: taux de curtailment réseau TSO (fraction, ex: 0.015)
+        sleeving_fee         : coût du fournisseur intermédiaire (€/MWh)
+        basis_risk           : écart structurel site vs hub (€/MWh, négatif = pénalité)
+
+    Retourne un dict avec :
+        capture_price_standard  : Σ(Q×spot) / ΣQ  (sans aucune clause)
+        capture_price_effective : avec toutes les clauses appliquées
+        effective_multiplier    : ratio effective / standard
+        neg_hours               : heures de production avec spot < 0
+        curtailed_hours         : heures curtailed (volontaire + réseau)
+        revenue_impact_pct      : impact total des clauses sur le revenu (%)
+    """
+    # Aligner les index
+    common = prod_profile.index.intersection(spot_profile.index)
+    Q     = prod_profile.reindex(common).fillna(0).values.astype(float)
+    spot  = spot_profile.reindex(common).values.astype(float)
+
+    total_vol_raw = Q.sum()
+    if total_vol_raw <= 0:
+        return {"error": "Volume de production nul"}
+
+    # ── 1. Capture price standard (sans clause) ───────────────────────────────
+    cp_std = float((Q * spot).sum() / total_vol_raw)
+
+    # ── 2. Curtailment réseau TSO (involontaire) ──────────────────────────────
+    Q_eff = Q * (1.0 - grid_curtailment_rate)
+
+    # ── 3. Curtailment volontaire (heures sous seuil) ─────────────────────────
+    curtailed_vol = 0.0
+    n_curtailed   = 0
+    if curtailment_threshold is not None:
+        mask_curtail = spot < curtailment_threshold
+        curtailed_vol = Q_eff[mask_curtail].sum()
+        n_curtailed   = int(mask_curtail.sum())
+        Q_eff[mask_curtail] = 0.0
+
+    # ── 4. Settlement avec plancher de prix ──────────────────────────────────
+    spot_settlement = spot.copy()
+    if neg_price_floor is not None:
+        spot_settlement = np.maximum(spot_settlement, neg_price_floor)
+
+    # Ajustement basis risk (le producteur reçoit prix_hub - basis_risk)
+    spot_settlement = spot_settlement - basis_risk
+
+    # ── 5. Calcul du revenu effectif ──────────────────────────────────────────
+    total_vol_eff = Q_eff.sum()
+    if total_vol_eff <= 0:
+        cp_eff = 0.0
+    else:
+        revenue_gross = (Q_eff * spot_settlement).sum()
+        # Déduire le sleeving fee sur le volume effectivement livré
+        revenue_net   = revenue_gross - sleeving_fee * total_vol_eff
+        cp_eff = float(revenue_net / total_vol_eff)
+
+    # ── 6. Métriques annexes ──────────────────────────────────────────────────
+    n_neg         = int(((spot < 0) & (Q > 0.01)).sum())
+    impact_pct    = (cp_eff - cp_std) / abs(cp_std) * 100 if cp_std != 0 else 0.0
+
+    return {
+        "capture_price_standard":  round(cp_std, 2),
+        "capture_price_effective": round(cp_eff, 2),
+        "effective_multiplier":    round(cp_eff / cp_std, 4) if cp_std != 0 else 0,
+        "neg_hours":               n_neg,
+        "curtailed_hours_voluntary": n_curtailed,
+        "curtailed_vol_mwh_per_mw": round(curtailed_vol, 1),
+        "revenue_impact_pct":      round(impact_pct, 2),
+        "sleeving_fee":            sleeving_fee,
+        "basis_risk":              basis_risk,
+        "grid_curtailment_rate":   grid_curtailment_rate,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. SCREENING DE SITES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def screen_sites(
+    site_metrics_df: pd.DataFrame,
+    min_cf: float = 0.10,
+    min_capture_rate: float = 0.80,
+    min_correlation: float | None = None,
+    max_cannibalization: float = 0.3,
+    technologies: list[str] | None = None,
+    top_n: int | None = None,
+) -> pd.DataFrame:
+    """
+    Filtre et classe les sites candidats selon des critères économiques.
+
+    Logique de screening (cohérente avec le marché PPA France 2024) :
+        1. Filtre sur CF minimum (viabilité technique du projet)
+        2. Filtre sur capture rate minimum (viabilité économique)
+        3. Filtre sur risque de cannibalisation (sécurité pour l'acheteur)
+        4. Filtre optionnel sur corrélation avec la charge (matching besoins client)
+        5. Filtre optionnel sur la technologie
+        6. Classement par score composite et sélection des top_n
+
+    Paramètres :
+        min_cf             : CF minimum (défaut 10% — solaire Nord marginalement viable)
+        min_capture_rate   : CR minimum (défaut 0.80 — élimine les sites très pénalisés)
+        min_correlation    : corrélation load minimum (None = pas de filtre)
+        max_cannibalization: risque max de cannibalisation (défaut 0.30)
+        technologies       : liste de technologies à garder (None = toutes)
+        top_n              : retourner seulement les N meilleurs sites
+
+    Retourne un DataFrame avec les sites passant tous les filtres, triés par score.
+    """
+    df = site_metrics_df.copy()
+
+    if df.empty:
+        return df
+
+    # Appliquer les filtres
+    mask = pd.Series(True, index=df.index)
+    if min_cf:
+        mask &= df["cf_mean"] >= min_cf
+    if min_capture_rate:
+        mask &= df["capture_rate_systeme"] >= min_capture_rate
+    if min_correlation is not None and "correlation_load" in df.columns:
+        mask &= df["correlation_load"].fillna(0) >= min_correlation
+    if max_cannibalization and "cannibalization_risk" in df.columns:
+        mask &= df["cannibalization_risk"] <= max_cannibalization
+    if technologies:
+        mask &= df["technology"].isin(technologies)
+
+    screened = df[mask].copy()
+
+    # Re-calculer le score composite avec pondération configurable
+    # Score = 0.5 × capture_rate + 0.3 × corrélation_load + 0.2 × (1 - cannibalization)
+    screened["score_composite"] = (
+        0.50 * screened["capture_rate_systeme"].clip(0, 2) / 1.5 +
+        0.30 * screened["correlation_load"].fillna(0).clip(-1, 1) / 1.0 +
+        0.20 * (1 - screened["cannibalization_risk"].fillna(0).clip(0, 1))
+    ).round(4)
+
+    screened = screened.sort_values("score_composite", ascending=False)
+
+    if top_n:
+        screened = screened.head(top_n)
+
+    n_filtered = len(site_metrics_df) - len(screened)
+    print(f"[SCREENING] {len(screened)} sites retenus ({n_filtered} éliminés)")
+    if not screened.empty:
+        print(f"  Top 3 : {screened['site'].head(3).tolist()}")
+        print(f"  Score max : {screened['score_composite'].max():.4f}")
+
+    return screened.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. GRID INFO FRANCE — trajectoires 2023-2050
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_france_grid_info(
+    start_year: int = 2023,
+    end_year: int = 2050,
+    eco2mix_filepath: str | None = None,
+    grid_csv_path: str | None = None,
+) -> pd.DataFrame:
+    """
+    Charge ou construit les trajectoires CAPEX/CO2/ENR pour la France.
+
+    Priorité :
+      1. grid_csv_path fourni explicitement
+      2. database/grid_france.csv généré par download_france_data.py
+      3. Valeurs calculées (trajectoires de référence)
+
+    Colonnes :
+      solar_capex, solar_opex, wind_onshore_capex, wind_onshore_opex,
+      wind_offshore_capex, wind_offshore_opex, bess_capex_per_mwh,
+      co2_intensity_g_kwh, ren_share, epex_spot_mean,
+      solar_cf_ref, wind_onshore_cf_ref, wind_offshore_cf_ref
+
+    Sources :
+      CAPEX  : IRENA Renewable Power Generation Costs 2023
+      CO2    : RTE eco2mix + trajectoire PPE
+      EPEX   : RTE Bilan Électrique 2024 + hypothèse centrale +2%/an
+      ENR    : RTE Futurs Énergétiques 2050 — scénario central
+    """
+    years = list(range(start_year, end_year + 1))
+    n     = len(years)
+    yr    = np.array(years)
+
+    # ── Charger grid_france.csv si disponible ─────────────────────────────────
+    for candidate in [grid_csv_path, str(_DB_DIR / "grid_france.csv")]:
+        if candidate and os.path.exists(candidate):
+            try:
+                df = pd.read_csv(candidate, index_col="year")
+                df = df.reindex(years)
+                # Interpoler les années manquantes
+                df = df.interpolate("index")
+                # Extrapoler si nécessaire
+                df = df.ffill().bfill()
+                print(f"[GRID] Chargé depuis {candidate}")
+                return df
+            except Exception as e:
+                print(f"[WARN] Erreur lecture grid_france.csv : {e}")
+
+    # ── Calcul de référence ───────────────────────────────────────────────────
+    print("[GRID] Calcul trajectoires de référence (grid_france.csv absent)")
+
+    solar_capex    = np.maximum(700_000 * np.exp(-0.028 * (yr - 2023)), 300_000)
+    wind_on_capex  = np.maximum(1_500_000 * np.exp(-0.010 * (yr - 2023)), 1_100_000)
+    wind_off_capex = np.maximum(3_000_000 * np.exp(-0.022 * (yr - 2023)), 1_600_000)
+    bess_capex     = np.maximum(200_000 * np.exp(-0.035 * (yr - 2023)), 60_000)
+    co2            = np.maximum(46.0 * np.exp(-0.045 * (yr - 2023)), 8.0)
+    ren_share      = 0.29 + (0.80 - 0.29) * (1 - np.exp(-0.060 * (yr - 2023)))
+    epex           = np.where(yr <= 2024,
+                              np.interp(yr, [2023, 2024], [96.0, 65.0]),
+                              65.0 * (1.02 ** (yr - 2024)))
+
+    # Charger eco2mix réel si disponible
     if eco2mix_filepath and os.path.exists(eco2mix_filepath):
-        print(f"[INFO] Chargement eco2mix depuis {eco2mix_filepath}")
-        co2, ren_share = _load_eco2mix_historical(eco2mix_filepath, years, co2, ren_share)
+        co2, ren_share = _load_eco2mix(eco2mix_filepath, years, co2, ren_share)
 
-    grid_df = pd.DataFrame({
-        "solar_capex": solar_capex,
-        "wind_capex": wind_capex,
-        "co2": co2,
-        "ren_share": ren_share,
-    }, index=list(years))
-    grid_df.index.name = "year"
+    df = pd.DataFrame({
+        "solar_capex":          solar_capex.round(0),
+        "solar_opex":           (solar_capex * 0.018).round(0),
+        "wind_onshore_capex":   wind_on_capex.round(0),
+        "wind_onshore_opex":    (wind_on_capex * 0.025).round(0),
+        "wind_offshore_capex":  wind_off_capex.round(0),
+        "wind_offshore_opex":   (wind_off_capex * 0.030).round(0),
+        "bess_capex_per_mwh":   bess_capex.round(0),
+        "co2_intensity_g_kwh":  co2.round(2),
+        "ren_share":            ren_share.round(4),
+        "epex_spot_mean":       epex.round(2),
+        "solar_cf_ref":         np.full(n, 0.148),
+        "wind_onshore_cf_ref":  np.full(n, 0.280),
+        "wind_offshore_cf_ref": np.full(n, 0.400),
+    }, index=years)
+    df.index.name = "year"
+    return df
 
-    return grid_df
 
-
-def _load_eco2mix_historical(filepath: str, years, co2_default, ren_default):
-    """Charge les données eco2mix réelles depuis ODRE pour remplacer les estimations."""
+def _load_eco2mix(filepath: str, years: list,
+                   co2_default: np.ndarray, ren_default: np.ndarray
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """Charge les valeurs historiques eco2mix ODRE pour remplacer les estimations."""
     try:
         df = pd.read_csv(filepath, sep=";", parse_dates=["Date - Heure"])
         df["year"] = df["Date - Heure"].dt.year
-        annual = df.groupby("year").agg({
+        ann = df.groupby("year").agg({
             "Taux de CO2 (g/kWh)": "mean",
-            "Taux d'EnR (%)": "mean"
+            "Taux d'EnR (%)":      "mean",
         })
-        co2_out = []
-        ren_out = []
-        for y in years:
-            if y in annual.index:
-                co2_out.append(annual.loc[y, "Taux de CO2 (g/kWh)"])
-                ren_out.append(annual.loc[y, "Taux d'EnR (%)"] / 100)
+        co2_out, ren_out = [], []
+        for i, y in enumerate(years):
+            if y in ann.index:
+                co2_out.append(ann.loc[y, "Taux de CO2 (g/kWh)"])
+                ren_out.append(ann.loc[y, "Taux d'EnR (%)"] / 100)
             else:
-                idx = list(years).index(y)
-                co2_out.append(co2_default[idx])
-                ren_out.append(ren_default[idx])
+                co2_out.append(co2_default[i])
+                ren_out.append(ren_default[i])
+        print(f"[GRID] eco2mix chargé depuis {filepath}")
         return np.array(co2_out), np.array(ren_out)
     except Exception as e:
-        print(f"[WARN] Impossible de charger eco2mix : {e}. Utilisation des valeurs par défaut.")
+        print(f"[WARN] eco2mix non chargé : {e}")
         return co2_default, ren_default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FONCTIONS UTILITAIRES PUBLIQUES (compatibilité modules aval)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_epex_series(year: int, csv_path: str | None = None,
+                     db_dir: Path | None = None) -> pd.Series:
+    """Accès public au profil EPEX horaire."""
+    ddir = db_dir or _DB_DIR
+    return _load_epex_profile(year, csv_path)
+
+
+def load_production_profile(site_col: str, technology: str,
+                              db_dir: Path | None = None) -> pd.Series | None:
+    """
+    Charge le profil de production normalisé [0..1] d'un site depuis SQLite.
+
+    Retourne None si le site est introuvable.
+    """
+    ddir = db_dir or _DB_DIR
+    if technology == "solar":
+        return _read_sqlite_series(ddir / "solar_patterns.db",
+                                    "solar_patterns", "datetime", site_col)
+    else:
+        return _read_sqlite_series(ddir / "wind_patterns.db",
+                                    "wind_patterns", "datetime", site_col)
+
+
+def load_capture_rates_db(db_dir: Path | None = None) -> pd.DataFrame | None:
+    """Charge le DataFrame de capture rates précalculés."""
+    ddir = db_dir or _DB_DIR
+    db   = ddir / "capture_rates.db"
+    if not db.exists():
+        return None
+    conn = sqlite3.connect(str(db))
+    try:
+        df = pd.read_sql("SELECT * FROM capture_rates", conn)
+        conn.close()
+        return df
+    except Exception:
+        conn.close()
+        return None
+
+
+def get_turpe_annual_cost_eur_per_mw(
+    peak_demand_mw: float,
+    turpe_params: dict | None = None,
+    turpe_filepath: str | None = None,
+    turpe_sheet: str = "HTB2",
+    num_years: int = 1,
+    rate_increase: float = 0.04,
+) -> pd.DataFrame:
+    """
+    Calcule la facture TURPE annuelle pour une puissance souscrite donnée.
+
+    Utile pour chiffrer l'économie TURPE d'un PPA on-site (exemption totale)
+    vs off-site (TURPE toujours dû).
+
+    Paramètres :
+        peak_demand_mw : puissance souscrite en MW
+        num_years      : nombre d'années de projection
+        rate_increase  : escalade annuelle du TURPE (défaut 4%/an historique)
+
+    Retourne un DataFrame par année avec le coût total TURPE (€/an).
+    """
+    if turpe_params is None:
+        turpe_params = load_turpe_params(turpe_filepath, turpe_sheet)
+
+    base_fee    = turpe_params["contract_fee_eur_kw_year"] * peak_demand_mw * 1000
+    rows = []
+    for offset in range(num_years):
+        yr  = 2024 + offset
+        esc = (1 + rate_increase) ** offset
+        rows.append({
+            "year":              yr,
+            "turpe_fee_eur_an":  round(base_fee * esc, 0),
+            "escalation_factor": round(esc, 4),
+        })
+    df = pd.DataFrame(rows).set_index("year")
+    return df
