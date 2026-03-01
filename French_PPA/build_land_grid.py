@@ -25,6 +25,7 @@ import json
 import argparse
 from pathlib import Path
 from typing import Optional
+import os as _os_ap
 
 import requests
 import numpy as np
@@ -82,7 +83,7 @@ CLC_COLORS = {
 
 # Coût câblage HTB France (€/MW/m) — barème RTE/ENEDIS 2024
 CABLE_EUR_PER_MW_PER_M = 35.0
-MIN_AREA_M2 = 25_000   # 2.5 ha = unité minimale CLC
+MIN_AREA_M2 = 1_000    # 0.1 ha minimum (RPG peut avoir de petites parcelles)
 
 
 # ==============================================================================
@@ -109,61 +110,113 @@ def get_bbox(lat, lon, km):
 # 2. API CORINE LAND COVER — IGN Géoplateforme (nouvelle URL 2024)
 # ==============================================================================
 
-def fetch_clc(lat, lon, buffer_km):
-    """
-    IGN Géoplateforme WFS — CORINE Land Cover 2018
-    URL : https://data.geopf.fr/wfs/ows
-    Layer : LANDCOVER.CLC18_FR
+# Mapping code_group RPG -> paramètres PV
+# (code_group: (label, dispo_pv, dispo_agrivol, eligible_agrivol))
+RPG_GROUP_PARAMS = {
+    "1":  ("Céréales",                    0.80, 0.10, True),
+    "2":  ("Oléagineux",                  0.80, 0.10, True),
+    "3":  ("Protéagineux",                0.80, 0.10, True),
+    "4":  ("Plantes à fibres",            0.75, 0.08, True),
+    "5":  ("Sucre",                       0.75, 0.08, True),
+    "6":  ("Fourrage",                    0.85, 0.10, True),
+    "7":  ("Légumes/fleurs",              0.50, 0.05, True),
+    "8":  ("Vignes",                      0.00, 0.00, False),  # AOP protégés
+    "9":  ("Fruits",                      0.40, 0.08, True),
+    "10": ("Oliviers",                    0.30, 0.05, True),
+    "11": ("Noix",                        0.40, 0.05, True),
+    "13": ("Prairies permanentes",        0.85, 0.10, True),
+    "14": ("Prairies temporaires",        0.85, 0.10, True),
+    "15": ("Estives/landes",              0.70, 0.05, True),
+    "16": ("Gel",                         0.90, 0.00, False),
+    "17": ("Divers",                      0.70, 0.08, True),
+    "18": ("Semences",                    0.75, 0.08, True),
+    "19": ("Légumineuses",                0.80, 0.10, True),
+    "20": ("Miscanthus/autres énergies",  0.85, 0.00, False),
+    "22": ("Vergers",                     0.40, 0.08, True),
+    "23": ("Autres cultures industrielles",0.75, 0.08, True),
+    "24": ("Surfaces non agricoles",      0.60, 0.00, False),
+    "25": ("Cultures permanentes",        0.50, 0.05, True),
+    "26": ("Bois/forêts",                 0.00, 0.00, False),
+    "27": ("Zones humides",               0.00, 0.00, False),
+    "28": ("Surfaces non exploitées",     0.90, 0.00, False),
+}
 
-    ⚠️ L'ancienne URL EEA (image.discomap.eea.europa.eu) est abandonnée.
-    ⚠️ L'ancienne URL IGN (wxs.ign.fr) est redirigée → data.geopf.fr depuis mars 2024.
-    Doc officielle : https://geoservices.ign.fr/services-web-experts-clc
+
+def fetch_rpg(lat, lon, buffer_km):
+    """
+    IGN Géoplateforme WFS — RPG (Registre Parcellaire Graphique) dernière édition
+    URL  : https://data.geopf.fr/wfs/wfs   (noter /wfs/wfs et non /wfs/ows)
+    Layer: RPG.LATEST:parcelles_graphiques
+    BBOX : ordre miny,minx,maxy,maxx (lat_min,lon_min,lat_max,lon_max) SANS SRSNAME
+
+    Avantages vs CLC :
+    - Vraies parcelles agricoles déclarées à la PAC
+    - Code culture précis (code_cultu + code_group)
+    - Géométries exactes des parcelles
+    - Mise à jour annuelle
     """
     miny, minx, maxy, maxx = get_bbox(lat, lon, buffer_km)
 
-    url = "https://data.geopf.fr/wfs/ows"
+    url = "https://data.geopf.fr/wfs/wfs"
     params = {
         "SERVICE":      "WFS",
         "VERSION":      "2.0.0",
         "REQUEST":      "GetFeature",
-        "TYPENAMES":    "LANDCOVER.CLC18_FR",
-        "BBOX":         f"{miny},{minx},{maxy},{maxx},EPSG:4326",
-        "SRSNAME":      "EPSG:4326",
+        "TYPENAMES":    "RPG.LATEST:parcelles_graphiques",
+        # CRITIQUE : ordre lat_min,lon_min,lat_max,lon_max SANS SRSNAME
+        "BBOX":         f"{miny},{minx},{maxy},{maxx}",
         "outputFormat": "application/json",
-        "COUNT":        "1000",
+        "COUNT":        "5000",
+        "SORTBY":       "surf_parc D",  # trier par surface décroissante
     }
 
-    print(f"[CLC] IGN Géoplateforme WFS → LANDCOVER.CLC18_FR...")
+    print(f"[RPG] IGN Géoplateforme → RPG.LATEST:parcelles_graphiques...")
     try:
-        r = requests.get(url, params=params, timeout=60)
+        r = requests.get(url, params=params, timeout=90)
         r.raise_for_status()
-        features = r.json().get("features", [])
-        print(f"[CLC] ✓ {len(features)} polygones reçus")
+        data = r.json()
+        features = data.get("features", [])
+        total = data.get("totalFeatures", 0)
+        print(f"[RPG] OK {len(features)} parcelles recues (total zone: {total:,})")
+
+        if not features:
+            print("[RPG] Zone vide -> fallback synthetique")
+            return _synth_clc(lat, lon, buffer_km)
 
         results = []
         for f in features:
             try:
                 geom = shape(f["geometry"]) if HAS_GEO else None
                 props = f.get("properties", {})
-                # Tester les deux noms de colonnes possibles selon la version
-                code_raw = props.get("CODE_18") or props.get("code_18") or props.get("code", "")
-                clc_code = int(str(code_raw).strip()) if str(code_raw).strip().isdigit() else 0
-                area = (props.get("SHAPE_Area") or props.get("shape_area")
-                        or (geom.area * 1.2e10 if geom else MIN_AREA_M2))
-                if clc_code:
-                    results.append({"geometry": geom, "clc_code": clc_code, "area_m2": float(area)})
+                code_group = str(props.get("code_group") or "17")
+                surf_ha = float(props.get("surf_parc") or 0)
+                # surf_parc est en hectares dans le RPG IGN
+                if surf_ha > 0:
+                    area_m2 = surf_ha * 1e4  # ha -> m²
+                elif geom is not None:
+                    # Convertir degrés² -> m² : 1°lat=111km, 1°lon=111km*cos(lat)
+                    import math as _math
+                    lat_approx = geom.centroid.y if hasattr(geom, "centroid") else 47.0
+                    area_m2 = geom.area * (111_000 ** 2) * _math.cos(_math.radians(lat_approx))
+                else:
+                    area_m2 = 5_000  # 0.5 ha par défaut
+                results.append({
+                    "geometry":   geom,
+                    "clc_code":   int(code_group) if code_group.isdigit() else 17,
+                    "clc_label":  RPG_GROUP_PARAMS.get(code_group, ("Divers", 0.70, 0.08, True))[0],
+                    "code_cultu": props.get("code_cultu", ""),
+                    "code_group": code_group,
+                    "area_m2":    float(area_m2),
+                })
             except Exception:
                 continue
 
-        if results:
-            return results
-        print("[CLC] Réponse vide — fallback synthétique")
+        print(f"[RPG] {len(results)} parcelles parsees")
+        return results
 
     except Exception as e:
-        print(f"[CLC] Erreur : {e}")
-
-    print("[CLC] → Données synthétiques (mode test)")
-    return _synth_clc(lat, lon, buffer_km)
+        print(f"[RPG] Erreur : {e} -> fallback synthetique")
+        return _synth_clc(lat, lon, buffer_km)
 
 
 def _synth_clc(lat, lon, buffer_km):
@@ -218,19 +271,21 @@ def _synth_clc_no_geo(lat, lon, buffer_km):
 
 def fetch_dvf(lat, lon, buffer_km):
     """
-    API CEREMA DVF open data — mutations foncières géolocalisées
-    URL : https://apidf-preprod.cerema.fr/dvf_opendata/geomutations/
-    Doc : https://apidf-preprod.cerema.fr/swagger/
+    API DVF open data — mutations foncières géolocalisées
+    URL de production : https://apidf-preprod.cerema.fr/dvf_opendata/geomutations/
 
-    ⚠️ L'ancienne URL api.dvf.etalab.gouv.fr n'existe plus.
-    L'API CEREMA est le remplaçant officiel open data.
-    Retourne dict {code_commune: prix_median_€/m²}
+    ⚠️  L'URL preprod retourne 403 depuis l'extérieur.
+    Alternative publique : télécharger le CSV DVF annuel depuis data.gouv.fr
+    et appeler fetch_dvf_from_csv() à la place.
+
+    URL CSV : https://files.data.gouv.fr/geo-dvf/latest/csv/{annee}/departements/{dept}.csv.gz
+    Exemple dept 59 (Nord) : https://files.data.gouv.fr/geo-dvf/latest/csv/2023/departements/59.csv.gz
     """
+    # Tentative API CEREMA production
     miny, minx, maxy, maxx = get_bbox(lat, lon, buffer_km)
-
     url = "https://apidf-preprod.cerema.fr/dvf_opendata/geomutations/"
     params = {
-        "in_bbox":         f"{minx},{miny},{maxx},{maxy}",  # lon_min,lat_min,lon_max,lat_max
+        "in_bbox":         f"{minx},{miny},{maxx},{maxy}",
         "nature_mutation": "Vente",
         "page_size":       500,
     }
@@ -266,8 +321,95 @@ def fetch_dvf(lat, lon, buffer_km):
         return result
 
     except Exception as e:
-        print(f"[DVF] Erreur : {e} — fallback régional")
-        return {"__default__": _dvf_fallback(lat)}
+        print(f"[DVF] API CEREMA indisponible ({type(e).__name__}) -> tentative CSV data.gouv.fr...")
+        return fetch_dvf_from_csv(lat, lon, buffer_km)
+
+
+def fetch_dvf_from_csv(lat, lon, buffer_km, year=2023):
+    """
+    Alternative 100% publique -- telecharge le CSV DVF par departement.
+    URL : https://files.data.gouv.fr/geo-dvf/latest/csv/{year}/departements/{dept}.csv.gz
+    Pas de cle API, pas d inscription. Mis a jour semestriellement par la DGFiP.
+    Utilise automatiquement si l API CEREMA est inaccessible.
+    """
+    import io
+    import gzip as gz_lib
+
+    depts = _guess_depts(lat, lon, buffer_km)
+    miny, minx, maxy, maxx = get_bbox(lat, lon, buffer_km)
+    all_prices = []
+    commune_prices = {}
+
+    for dept in depts:
+        url = f"https://files.data.gouv.fr/geo-dvf/latest/csv/{year}/departements/{dept}.csv.gz"
+        print(f"[DVF] CSV data.gouv.fr -> departement {dept}...")
+        try:
+            r = requests.get(url, timeout=90)
+            r.raise_for_status()
+            buf = io.BytesIO(r.content)
+            with gz_lib.open(buf, "rt", encoding="utf-8") as f:
+                df = pd.read_csv(f, low_memory=False)
+
+            if "nature_mutation" in df.columns:
+                df = df[df["nature_mutation"] == "Vente"]
+            # Garder uniquement les terrains nus agricoles (type_local vide)
+            if "type_local" in df.columns:
+                df = df[df["type_local"].isna() | (df["type_local"] == "")]
+            required = ["latitude", "longitude", "valeur_fonciere", "surface_terrain"]
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                raise ValueError(f"Colonnes manquantes : {missing}")
+
+            df = df.dropna(subset=required)
+            df["surface_terrain"] = pd.to_numeric(df["surface_terrain"], errors="coerce")
+            df["valeur_fonciere"] = pd.to_numeric(df["valeur_fonciere"], errors="coerce")
+            df = df[df["surface_terrain"] > 100]
+            df = df[(df["latitude"] >= miny) & (df["latitude"] <= maxy) &
+                    (df["longitude"] >= minx) & (df["longitude"] <= maxx)]
+            df["prix_m2"] = df["valeur_fonciere"] / df["surface_terrain"]
+            df = df[(df["prix_m2"] >= 0.05) & (df["prix_m2"] <= 100)]
+
+            print(f"[DVF] OK {len(df)} transactions (dept {dept})")
+            for code, grp in df.groupby("code_commune"):
+                commune_prices.setdefault(str(code), []).extend(grp["prix_m2"].tolist())
+            all_prices.extend(df["prix_m2"].tolist())
+
+        except Exception as e2:
+            print(f"[DVF] Dept {dept} : {type(e2).__name__}: {e2}")
+
+    if all_prices:
+        med = float(np.median(all_prices))
+        print(f"[DVF] OK Prix median : {med:.2f} euro/m2 ({len(all_prices)} transactions)")
+        result = {c: float(np.median(v)) for c, v in commune_prices.items()}
+        result["__default__"] = med
+        return result
+
+    print("[DVF] Aucune donnee -> fallback SAFER")
+    return {"__default__": _dvf_fallback(lat)}
+
+
+def _guess_depts(lat, lon, buffer_km):
+    """Retourne les codes departement(s) dans le buffer (approximation par centroides)."""
+    dept_centroids = {
+        "59": (50.63, 3.06), "62": (50.29, 2.78), "80": (49.89, 2.30),
+        "02": (49.56, 3.62), "60": (49.41, 2.08), "76": (49.44, 1.10),
+        "27": (49.03, 1.15), "14": (49.18, -0.37), "50": (49.12, -1.08),
+        "61": (48.43,  0.09), "75": (48.86, 2.35), "78": (48.77, 1.98),
+        "91": (48.63, 2.23), "92": (48.85, 2.23), "93": (48.91, 2.48),
+        "94": (48.79, 2.46), "95": (49.05, 2.08), "77": (48.62, 2.71),
+        "57": (49.12, 6.18), "67": (48.57, 7.75), "69": (45.75, 4.85),
+        "13": (43.30, 5.38), "33": (44.84, -0.58), "31": (43.60, 1.44),
+        "06": (43.71, 7.26), "44": (47.22, -1.55), "35": (48.12, -1.68),
+        "29": (48.39, -4.49), "56": (47.66, -2.75), "22": (48.51, -2.77),
+        "63": (45.78,  3.08), "87": (45.83,  1.26),
+    }
+    result = [c for c, (dlat, dlon) in dept_centroids.items()
+              if haversine_m(lat, lon, dlat, dlon) < buffer_km * 1000 * 2.5]
+    if not result:
+        closest = min(dept_centroids.items(),
+                      key=lambda x: haversine_m(lat, lon, x[1][0], x[1][1]))
+        result = [closest[0]]
+    return result[:3]
 
 
 def _dvf_fallback(lat):
@@ -296,47 +438,53 @@ def fetch_protected(lat, lon, buffer_km):
     """
     miny, minx, maxy, maxx = get_bbox(lat, lon, buffer_km)
 
-    url = "https://ws.carmencarto.fr/WFS/119/fxx_natura2000"
-    params = {
-        "SERVICE":      "WFS",
-        "VERSION":      "1.1.0",
-        "REQUEST":      "GetFeature",
-        "TYPENAME":     "ZNIEFF1",
-        "BBOX":         f"{miny},{minx},{maxy},{maxx}",
-        "SRSNAME":      "EPSG:4326",
-        "outputFormat": "application/json",
-        "maxFeatures":  "100",
-    }
+    # IGN Géoplateforme WFS — couches PatriNat (INPN)
+    # Meme regle BBOX que RPG : miny,minx,maxy,maxx SANS SRSNAME
+    url = "https://data.geopf.fr/wfs/wfs"
+    zones = []
 
-    print(f"[INPN] WFS Carmen → zones ZNIEFF1 + Natura 2000...")
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        features = r.json().get("features", [])
-        zones = []
-        for f in features:
-            if HAS_GEO:
-                try:
-                    geom = shape(f["geometry"])
-                    zones.append({
-                        "geometry": geom,
-                        "type": "ZNIEFF1",
-                        "name": f.get("properties", {}).get("NOM", ""),
-                    })
-                except Exception:
-                    pass
-        print(f"[INPN] ✓ {len(zones)} zones protégées trouvées")
-        return zones
-    except Exception as e:
-        print(f"[INPN] Non disponible ({type(e).__name__}) — ignoré")
-        return []
+    for layer, zone_type in [
+        ("patrinat_znieff1:znieff1", "ZNIEFF1"),
+        ("patrinat_sic:sic",         "Natura2000-SIC"),
+        ("patrinat_zps:zps",         "Natura2000-ZPS"),
+    ]:
+        params = {
+            "SERVICE":      "WFS",
+            "VERSION":      "2.0.0",
+            "REQUEST":      "GetFeature",
+            "TYPENAMES":    layer,
+            "BBOX":         f"{miny},{minx},{maxy},{maxx}",
+            "outputFormat": "application/json",
+            "COUNT":        "100",
+        }
+        print(f"[INPN] IGN WFS -> {layer}...")
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            features = r.json().get("features", [])
+            for f in features:
+                if HAS_GEO:
+                    try:
+                        geom = shape(f["geometry"])
+                        props = f.get("properties", {})
+                        name = (props.get("nom_znieff") or props.get("nom")
+                                or props.get("sitename") or "")
+                        zones.append({"geometry": geom, "type": zone_type, "name": name})
+                    except Exception:
+                        pass
+            print(f"[INPN] OK {len(features)} zones {zone_type}")
+        except Exception as e:
+            print(f"[INPN] {layer} : {type(e).__name__}")
+
+    print(f"[INPN] Total : {len(zones)} zones protegees")
+    return zones
 
 
 # ==============================================================================
 # 5. CONSTRUCTION DU LAND GRID
 # ==============================================================================
 
-def build_land_grid(lat, lon, buffer_km=30.0, output_dir="gisdata",
+def build_land_grid(lat, lon, buffer_km=30.0, output_dir=None,
                     synthetic_mode=False, skip_protected=False):
     """
     Fonction principale — construit la grille de terrains candidats.
@@ -357,7 +505,7 @@ def build_land_grid(lat, lon, buffer_km=30.0, output_dir="gisdata",
     print(f"{'='*60}")
 
     # ── 1. Données CLC ────────────────────────────────────────────────────────
-    clc = _synth_clc(lat, lon, buffer_km) if synthetic_mode else fetch_clc(lat, lon, buffer_km)
+    clc = _synth_clc(lat, lon, buffer_km) if synthetic_mode else fetch_rpg(lat, lon, buffer_km)
 
     # ── 2. Prix fonciers DVF ──────────────────────────────────────────────────
     dvf = {"__default__": _dvf_fallback(lat)} if synthetic_mode else fetch_dvf(lat, lon, buffer_km)
@@ -372,19 +520,22 @@ def build_land_grid(lat, lon, buffer_km=30.0, output_dir="gisdata",
     for feat in clc:
         code = feat["clc_code"]
 
-        if code in CLC_EXCLUDED:
-            excl_class += 1
-            continue
-        if code not in CLC_SOLAR_CLASSES:
-            excl_class += 1
-            continue
+        # RPG: code = code_group (int), use RPG_GROUP_PARAMS
+        code_group_str = str(feat.get("code_group") or code)
+        if code_group_str not in RPG_GROUP_PARAMS:
+            # Groupe inconnu -> traiter comme divers avec dispo partielle
+            code_group_str = "17"
 
-        label, avail_pv, avail_agri, elig_agri = CLC_SOLAR_CLASSES[code]
+        label, avail_pv, avail_agri, elig_agri = RPG_GROUP_PARAMS[code_group_str]
+
+        if avail_pv == 0 and avail_agri == 0:
+            excl_class += 1
+            continue
         area_m2 = feat["area_m2"]
 
-        if area_m2 < MIN_AREA_M2:
-            excl_size += 1
-            continue
+        # Pas de filtre taille minimum pour RPG — on garde toutes les parcelles
+        # (les petites parcelles adjacentes s'agrègeront dans le merit order)
+        pass  # excl_size non utilisé pour RPG
 
         geom = feat.get("geometry")
         if geom is not None and HAS_GEO:
@@ -408,6 +559,7 @@ def build_land_grid(lat, lon, buffer_km=30.0, output_dir="gisdata",
         row = {
             "clc_code":       code,
             "clc_label":      label,
+            "code_cultu":     feat.get("code_cultu", ""),
             "area_m2":        area_m2,
             "area_photo":     area_m2 * avail_pv,                           # ← costutils.py
             "area_agrivol":   area_m2 * avail_agri if elig_agri else 0.0,   # ← costutils.py
@@ -665,7 +817,7 @@ def _print_stats(gdf):
 # ==============================================================================
 
 def process_grid_site_data_france(client_lat, client_lon, buffer_km=30.0,
-                                   cache_dir="gisdata", force_rebuild=False,
+                                   cache_dir=None, force_rebuild=False,
                                    synthetic_mode=False):
     """
     Drop-in replacement de process_grid_site_data() dans costutils.py.
@@ -704,7 +856,8 @@ if __name__ == "__main__":
     parser.add_argument("--lat",       type=float, default=50.93, help="Latitude site client")
     parser.add_argument("--lon",       type=float, default=2.38,  help="Longitude site client")
     parser.add_argument("--buffer",    type=float, default=30.0,  help="Rayon de recherche (km)")
-    parser.add_argument("--output",    type=str,   default="gisdata", help="Dossier de sortie")
+    _default_out = _os_ap.path.join(_os_ap.path.dirname(_os_ap.path.abspath(__file__)), "gisdata")
+    parser.add_argument("--output",    type=str,   default=_default_out, help="Dossier de sortie")
     parser.add_argument("--synthetic", action="store_true", help="Données synthétiques (test sans internet)")
     parser.add_argument("--no-inpn",   action="store_true", help="Ne pas interroger INPN (plus rapide)")
     parser.add_argument("--force",     action="store_true", help="Reconstruire même si cache présent")

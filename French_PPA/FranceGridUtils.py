@@ -34,7 +34,132 @@ import os
 #    → process_france_grid_data()
 # ============================================================
 
+def load_turpe_params(turpe_filepath: str = None, sheet: str = "HTB2",
+                      version: str = "MU") -> dict:
+    """
+    Charge les paramètres TURPE depuis TURPE_france.xlsx.
+
+    Paramètres :
+    -----------
+    turpe_filepath : str
+        Chemin vers TURPE_france.xlsx. Si None, cherche dans database/ puis dans
+        le même dossier que ce script.
+    sheet : str
+        "HTB1", "HTB2" ou "HTB3" selon la tension de raccordement du client.
+    version : str
+        "CU" (courte utilisation), "MU" (moyenne), "LU" (longue utilisation).
+
+    Retourne un dict avec les clés attendues par process_france_grid_data().
+    """
+    import os as _os
+    if turpe_filepath is None:
+        # Chercher automatiquement
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        candidates = [
+            _os.path.join(_here, "database", "TURPE_france.xlsx"),
+            _os.path.join(_here, "TURPE_france.xlsx"),
+            "database/TURPE_france.xlsx",
+            "TURPE_france.xlsx",
+        ]
+        for c in candidates:
+            if _os.path.exists(c):
+                turpe_filepath = c
+                break
+
+    # Valeurs de fallback (TURPE 6 HTB2 MU Nov 2024)
+    fallback = {
+        "contract_fee_eur_kw_year": 7.1,
+        "HPTE": 11.444, "HPSH": 8.924, "HCSH": 6.824,
+        "HPSB": 5.354,  "HCSB": 3.570,
+        # Alias HP/HC pour compatibilité ancienne version
+        "HPH": 8.924, "HCH": 6.824, "HPE": 5.354, "HCE": 3.570,
+        "ticfe": 0.5, "cta": 0.3,
+        "gestion_eur_an": 9873.3,
+    }
+
+    if turpe_filepath is None or not _os.path.exists(turpe_filepath):
+        print(f"[TURPE] Fichier non trouvé — valeurs TURPE 6 HTB2 MU Nov 2024 par défaut")
+        return fallback
+
+    try:
+        df = pd.read_excel(turpe_filepath, sheet_name=sheet, header=None)
+
+        if sheet == "HTB3":
+            # HTB3 : tarif unique sans différenciation temporelle
+            # Chercher la ligne avec "Soutirage énergie"
+            for i, row in df.iterrows():
+                if "soutirage" in str(row.iloc[0]).lower():
+                    # Prendre la valeur Nov 2024 (col 2) en c€/kWh → ×10 pour €/MWh
+                    val_mwh = float(row.iloc[2]) * 10
+                    return {
+                        "contract_fee_eur_kw_year": 0.0,  # HTB3 : pas de composante puissance
+                        "HPTE": val_mwh, "HPSH": val_mwh, "HCSH": val_mwh,
+                        "HPSB": val_mwh, "HCSB": val_mwh,
+                        "HPH": val_mwh, "HCH": val_mwh, "HPE": val_mwh, "HCE": val_mwh,
+                        "ticfe": 0.5, "cta": 0.3, "gestion_eur_an": 9873.3,
+                    }
+        else:
+            # HTB1 / HTB2 : trouver la colonne de la version (CU/MU/LU) Nov 2024
+            # Chercher la ligne d'en-tête avec "b (€/kW/an)"
+            header_row = None
+            version_col_b = None
+            version_col_c = None
+
+            for i, row in df.iterrows():
+                if "b (€/kW/an)" in str(row.values):
+                    header_row = i
+                    # Trouver la colonne de la version Nov 2024
+                    # L'ordre est CU-2021, CU-Nov2024, MU-2021, MU-Nov2024, LU-2021, LU-Nov2024
+                    ver_map = {"CU": (2, 3), "MU": (6, 7), "LU": (10, 11)}
+                    version_col_b, version_col_c = ver_map.get(version, (6, 7))
+                    break
+
+            if header_row is not None:
+                # Classes dans l'ordre : HPTE, HPSH, HCSH, HPSB, HCSB
+                classes = ["HPTE", "HPSH", "HCSH", "HPSB", "HCSB"]
+                params = {}
+                data_rows = df.iloc[header_row+1:header_row+6].reset_index(drop=True)
+                for idx, cls in enumerate(classes):
+                    if idx < len(data_rows):
+                        b = float(data_rows.iloc[idx, version_col_b])   # €/kW/an
+                        c = float(data_rows.iloc[idx, version_col_c]) * 10  # c€/kWh → €/MWh
+                        params[cls] = c
+
+                # contract_fee = b moyen pondéré (on prend HPSH comme référence MU)
+                b_ref = float(data_rows.iloc[1, version_col_b])
+
+                # Lire gestion annuelle depuis onglet contract
+                try:
+                    contract_df = pd.read_excel(turpe_filepath, sheet_name="contract", header=None)
+                    for _, row in contract_df.iterrows():
+                        if str(row.iloc[0]).strip().upper() == sheet.upper():
+                            b_ref = float(row.iloc[1])
+                            break
+                except Exception:
+                    pass
+
+                # Alias HP/HC
+                params.update({
+                    "contract_fee_eur_kw_year": b_ref,
+                    "HPH": params.get("HPSH", fallback["HPH"]),
+                    "HCH": params.get("HCSH", fallback["HCH"]),
+                    "HPE": params.get("HPSB", fallback["HPE"]),
+                    "HCE": params.get("HCSB", fallback["HCE"]),
+                    "ticfe": 0.5, "cta": 0.3, "gestion_eur_an": 9873.3,
+                })
+                print(f"[TURPE] Chargé depuis {turpe_filepath} — {sheet} {version} Nov 2024")
+                return params
+
+    except Exception as e:
+        print(f"[TURPE] Erreur lecture {turpe_filepath} : {e} — valeurs par défaut")
+
+    return fallback
+
+
 def process_france_grid_data(year: int, epex_filepath: str = None,
+                              turpe_filepath: str = None,
+                              turpe_sheet: str = "HTB2",
+                              turpe_version: str = "MU",
                               turpe_params: dict = None) -> tuple:
     """
     Construit le profil horaire du coût d'électricité réseau pour un industriel français HTB.
@@ -76,18 +201,7 @@ def process_france_grid_data(year: int, epex_filepath: str = None,
     # Note : Ces valeurs évoluent chaque année. Toujours vérifier sur cre.fr.
 
     if turpe_params is None:
-        turpe_params = {
-            # Composante annuelle puissance souscrite (€/kW/an) → équiv. contract_fee
-            "contract_fee_eur_kw_year": 7.5,
-            # Composante énergie par type d'heure (€/MWh)
-            "HPH": 5.2,   # Heures Pleines Hiver
-            "HCH": 1.8,   # Heures Creuses Hiver
-            "HPE": 1.0,   # Heures Pleines Été
-            "HCE": 0.5,   # Heures Creuses Été
-            # Taxes et contributions (€/MWh) - pour industriels HTB souvent exonérés partiellement
-            "ticfe": 0.5,   # TICFE réduite pour industriels intensifs (vs 20.5 €/MWh particuliers)
-            "cta": 0.3,     # Contribution Tarifaire d'Acheminement
-        }
+        turpe_params = load_turpe_params(turpe_filepath, sheet=turpe_sheet, version=turpe_version)
 
     contract_fee = turpe_params["contract_fee_eur_kw_year"]
 
@@ -106,7 +220,7 @@ def process_france_grid_data(year: int, epex_filepath: str = None,
         epex_df = _generate_synthetic_epex_profile(year, base_price_eur_mwh=80.0)
 
     # Calcul du TURPE énergie selon les heures
-    turpe_energy = _compute_turpe_energy_by_hour(date_range, turpe_params, year)
+    turpe_energy = _compute_turpe_energy_by_hour(date_range, turpe_params, year, turpe_filepath)
 
     # Assemblage du DataFrame temporel
     temporal_df = pd.DataFrame(index=date_range)
@@ -199,34 +313,145 @@ def _generate_synthetic_epex_profile(year: int, base_price_eur_mwh: float = 80.0
     return pd.Series(prices, index=date_range, name="epex_spot")
 
 
+def load_turpe_timezone(turpe_filepath: str = None) -> pd.DataFrame:
+    """
+    Charge la grille horaire HP/HC par mois depuis TURPE_france.xlsx onglet 'timezone'.
+    Retourne un DataFrame (24 lignes × 12 colonnes mois) avec valeurs 'HP' ou 'HC'.
+    """
+    import os as _os
+    if turpe_filepath is None:
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        for c in [_os.path.join(_here, "database", "TURPE_france.xlsx"),
+                  _os.path.join(_here, "TURPE_france.xlsx"),
+                  "database/TURPE_france.xlsx"]:
+            if _os.path.exists(c):
+                turpe_filepath = c
+                break
+
+    if turpe_filepath and _os.path.exists(turpe_filepath):
+        try:
+            df = pd.read_excel(turpe_filepath, sheet_name="timezone", header=None)
+            # Trouver la ligne avec "heure" comme en-tête
+            for i, row in df.iterrows():
+                if str(row.iloc[0]).strip().lower() == "heure":
+                    header_idx = i
+                    break
+            else:
+                raise ValueError("En-tête 'heure' non trouvé")
+            df.columns = df.iloc[header_idx]
+            df = df.iloc[header_idx+1:].reset_index(drop=True)
+            df = df[df["heure"].apply(lambda x: str(x).strip().isdigit())]
+            df["heure"] = df["heure"].astype(int)
+            df = df.set_index("heure")
+            # Garder uniquement les colonnes mois (Jan..Dec)
+            mois_cols = ["Jan","Feb","Mar","Apr","May","Jun",
+                         "Jul","Aug","Sep","Oct","Nov","Dec"]
+            df = df[[c for c in mois_cols if c in df.columns]]
+            return df
+        except Exception as e:
+            print(f"[TURPE] timezone non chargé : {e}")
+
+    # Fallback : TURPE 6 HTB — HP=8h-20h semaine, HC=reste
+    rows = {}
+    for h in range(24):
+        hp = "HP" if 8 <= h < 20 else "HC"
+        rows[h] = {m: hp for m in ["Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"]}
+    return pd.DataFrame(rows).T
+
+
+def load_turpe_season(turpe_filepath: str = None) -> dict:
+    """
+    Charge le mapping mois→saison depuis TURPE_france.xlsx onglet 'season'.
+    Retourne dict {mois_abrégé: 'Haute'|'Basse'}.
+    """
+    import os as _os
+    if turpe_filepath is None:
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        for c in [_os.path.join(_here, "database", "TURPE_france.xlsx"),
+                  _os.path.join(_here, "TURPE_france.xlsx"),
+                  "database/TURPE_france.xlsx"]:
+            if _os.path.exists(c):
+                turpe_filepath = c
+                break
+
+    fallback = {
+        "Jan": "Haute", "Feb": "Haute", "Mar": "Haute",
+        "Apr": "Basse", "May": "Basse", "Jun": "Basse",
+        "Jul": "Basse", "Aug": "Basse", "Sep": "Basse",
+        "Oct": "Basse", "Nov": "Haute", "Dec": "Haute",
+    }
+    if turpe_filepath and _os.path.exists(turpe_filepath):
+        try:
+            df = pd.read_excel(turpe_filepath, sheet_name="season", header=None)
+            for i, row in df.iterrows():
+                if str(row.iloc[0]).strip().lower() == "mois":
+                    header_idx = i
+                    break
+            else:
+                return fallback
+            df.columns = df.iloc[header_idx]
+            df = df.iloc[header_idx+1:].reset_index(drop=True)
+            df = df.dropna(subset=["Mois"])
+            return dict(zip(df["Mois"].astype(str).str.strip(),
+                            df["Saison"].astype(str).str.strip()))
+        except Exception as e:
+            print(f"[TURPE] season non chargé : {e}")
+    return fallback
+
+
 def _compute_turpe_energy_by_hour(date_range: pd.DatetimeIndex,
-                                   turpe_params: dict, year: int) -> pd.Series:
+                                   turpe_params: dict, year: int,
+                                   turpe_filepath: str = None) -> pd.Series:
     """
     Calcule la composante énergie du TURPE HTB par heure.
+    Utilise la grille HP/HC et le mapping saisonnier de TURPE_france.xlsx.
 
-    Grille HPH/HCH/HPE/HCE selon le calendrier EDF/ENEDIS :
-    - Hiver = Novembre à Mars (inclusive)
-    - HP = 6h-22h en semaine (hors JF)
-    - HC = 22h-6h + week-ends + jours fériés
+    Classes TURPE 6 HTB2 :
+      HPTE = Heures Pleines Très Hautes Eaux (pas en France standard)
+      HPSH = HP Saison Haute
+      HCSH = HC Saison Haute
+      HPSB = HP Saison Basse
+      HCSB = HC Saison Basse
     """
-    months = date_range.month
-    hours = date_range.hour
-    weekdays = date_range.weekday  # 0=lundi, 5=samedi, 6=dimanche
+    tz_grid  = load_turpe_timezone(turpe_filepath)
+    season_map = load_turpe_season(turpe_filepath)
 
-    is_winter = months.isin([11, 12, 1, 2, 3])
-    is_daytime = (hours >= 6) & (hours < 22)
-    is_weekday = weekdays < 5  # Lundi-Vendredi
+    month_abbr = ["Jan","Feb","Mar","Apr","May","Jun",
+                  "Jul","Aug","Sep","Oct","Nov","Dec"]
 
-    hph_mask = is_winter & is_daytime & is_weekday
-    hch_mask = is_winter & ~(is_daytime & is_weekday)
-    hpe_mask = ~is_winter & is_daytime & is_weekday
-    hce_mask = ~is_winter & ~(is_daytime & is_weekday)
+    months   = date_range.month
+    hours    = date_range.hour
+    weekdays = date_range.weekday  # 0=lundi, 6=dimanche
 
     turpe_energy = np.zeros(len(date_range))
-    turpe_energy[hph_mask] = turpe_params["HPH"]
-    turpe_energy[hch_mask] = turpe_params["HCH"]
-    turpe_energy[hpe_mask] = turpe_params["HPE"]
-    turpe_energy[hce_mask] = turpe_params["HCE"]
+
+    for i, (m, h, wd) in enumerate(zip(months, hours, weekdays)):
+        mois_str = month_abbr[m - 1]
+        season = season_map.get(mois_str, "Basse")
+        is_hp_day = wd < 5  # lundi-vendredi
+
+        # Lire HP/HC depuis la grille
+        try:
+            hp_hc = tz_grid.loc[h, mois_str] if mois_str in tz_grid.columns else ("HP" if 8 <= h < 20 else "HC")
+        except Exception:
+            hp_hc = "HP" if 8 <= h < 20 else "HC"
+
+        # week-end/JF → toujours HC
+        if not is_hp_day:
+            hp_hc = "HC"
+
+        # Mapper vers la clé TURPE
+        if season == "Haute" and hp_hc == "HP":
+            key = "HPSH"
+        elif season == "Haute" and hp_hc == "HC":
+            key = "HCSH"
+        elif season == "Basse" and hp_hc == "HP":
+            key = "HPSB"
+        else:
+            key = "HCSB"
+
+        turpe_energy[i] = turpe_params.get(key, turpe_params.get("HPH", 5.0))
 
     return pd.Series(turpe_energy, index=date_range)
 
