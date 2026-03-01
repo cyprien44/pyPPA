@@ -1,315 +1,251 @@
-# Guide d'adaptation PPA — Version France 🇫🇷
+# French PPA Model — README v3.0
 
-## Vue d'ensemble
-
-Ce dossier contient tout le nécessaire pour adapter le modèle PPA coréen (SK/Samsung)
-au contexte d'un industriel français cherchant à optimiser son approvisionnement
-en électricité renouvelable via des PPAs.
+> Modèle d'optimisation des contrats PPA pour industriels français raccordés en haute tension (HTB)
+> **Version 3.0 · Mars 2026**
+> Cas d'usage : ArcelorMittal Dunkerque (685 MW) · H2 Normandie (200 MW)
 
 ---
 
-## Structure des fichiers à créer/modifier
+## 1. Présentation du modèle
+
+Le French PPA Model évalue et optimise la stratégie d'approvisionnement en électricité renouvelable d'un industriel français. Il simule heure par heure, sur 20 ans, la production ENR, le prix spot EPEX, le TURPE HTB, les clauses contractuelles et calcule la VAN des économies réalisées.
+
+### Ce que le modèle fait
+- **Screener** les meilleurs sites solaires et éoliens disponibles pour un client (capture rate, corrélation charge, LCOE)
+- **Optimiser** le mix PPA par programmation linéaire (scipy LP) : MW par site, prix PPA minimum, couverture charge cible
+- **Calculer** le settlement financier annuel selon 6 structures contractuelles (fixed, collar, indexed_spot, floor_only...)
+- **Projeter** le cashflow sur 20 ans (dégradation technique, escalade TURPE/EPEX/GO) et calculer VAN, payback, IRR
+- **Visualiser** toutes les données et résultats dans une interface Streamlit 5 pages
+
+### Ce que le modèle ne fait PAS
+- Calcul de dimensionnement de raccordement réseau (RTE/ENEDIS — à traiter séparément)
+- Valorisation des flexibilités (effacement, balancing market)
+- Modélisation des prix forward au-delà des hypothèses RTE Futurs Énergétiques 2050
+- Consultation réglementaire sur les contrats — résultats à valider avec un juriste énergie
+
+> **Note migration Corée → France** : ce modèle est une adaptation complète du modèle PPA coréen original (SK/Samsung). La migration est totale : devise EUR native, TURPE HTB à la place du KEPCO, EPEX Spot à la place du SMP, GOs à la place des RECs, `FranceGridUtils.py` à la place de `KEPCOutils.py`. Les fichiers de compatibilité intermédiaires (`ppamodule_france_adaptations.py`, `KEPCO_france.xlsx`) n'existent plus.
+
+---
+
+## 2. Structure du projet
 
 ```
-votre_projet/
-├── FranceGridUtils.py              ← NOUVEAU (remplace KEPCOutils.py)
-├── download_france_data.py         ← NOUVEAU (télécharge les données)
-├── ppamodule_france_adaptations.py ← DOCUMENTATION des modifications
+French_PPA/
+├── app.py                          ← Interface Streamlit (1 522 lignes)
+├── ppamodule.py                    ← Moteur de calcul PPA (1 289 lignes)
+├── FranceGridUtils.py              ← Utilitaires réseau & sites (1 023 lignes)
+├── download_france_data.py         ← Téléchargement données (944 lignes)
+├── build_land_grid.py              ← Données GIS foncières (inchangé)
+├── explore_ppa_data_france.ipynb   ← Notebook d'exploration (usage local)
+├── scenario_defaults.xlsx          ← Paramètres des 6 scénarios (60+ params)
 │
-├── database/                        ← À créer avec download_france_data.py
-│   ├── grid_france.csv              ← Remplace grid.csv
-│   ├── KEPCO_france.xlsx            ← Remplace KEPCO.xlsx
-│   ├── wind_grid_france.xlsx        ← Remplace wind_grid.xlsx
-│   ├── solar_patterns.db            ← Téléchargé depuis PVGIS
-│   ├── wind_patterns.db             ← Téléchargé depuis Open-Meteo
-│   ├── load_patterns.db             ← Profil industriel français
-│   └── NGFS_carbonprice.xlsx        ← INCHANGÉ (NGFS est global)
+├── database/
+│   ├── grid_france.csv             ← Trajectoires CAPEX/CO2/ENR 2023-2050
+│   ├── TURPE_france.xlsx           ← Tarifs TURPE 6 HTB (CRE Nov. 2024)
+│   ├── wind_grid_france.xlsx       ← 12 parcs éoliens (offshore + onshore)
+│   ├── solar_patterns.db           ← Profils PV horaires (10 sites PVGIS)
+│   ├── wind_patterns.db            ← Profils éoliens (10 zones ERA5)
+│   ├── load_patterns.db            ← Profils charge (4 types industriels)
+│   ├── epex_profiles.db            ← Prix EPEX DA horaires (cache SQLite)
+│   └── capture_rates.db            ← Capture rates précalculés
 │
-└── gisdata/                         ← Données géospatiales (voir ci-dessous)
-    ├── clusterpolygon.gpkg          ← Site(s) de l'industriel
-    └── db_semippa.gpkg              ← Grille de terrains disponibles
+└── gisdata/                        ← Généré par build_land_grid.py
+    ├── db_semippa_auto.gpkg        ← Parcelles candidates (RPG IGN)
+    ├── db_semippa_auto.csv         ← Même données en CSV
+    └── db_semippa_auto_map.html    ← Carte interactive Leaflet.js
 ```
 
 ---
 
-## Étape 1 : Installer les dépendances
+## 3. Installation et démarrage
+
+### 3.1 Dépendances Python
 
 ```bash
-# Les mêmes que le projet original, plus :
-pip install requests open-meteo pvlib
+# Dépendances obligatoires
+pip install pandas numpy scipy plotly streamlit openpyxl requests
+
+# Pour build_land_grid.py uniquement (données GIS foncières)
+pip install geopandas shapely
+
+# Pour le notebook explore_ppa_data_france.ipynb
+pip install notebook nbformat
 ```
 
----
-
-## Étape 2 : Télécharger les données automatiquement
+### 3.2 Démarrage en mode offline (données synthétiques — immédiat)
 
 ```bash
+# Étape 1 : générer toutes les données synthétiques
+python download_france_data.py --offline
+
+# Étape 2 : lancer l'interface Streamlit
+streamlit run app.py
+# → Accéder à http://localhost:8501
+```
+
+> Le mode offline génère des données synthétiques calibrées (PVGIS, ERA5, EPEX, trajectoires ADEME). Suffisant pour tester le modèle et configurer les scénarios. Les résultats absolus ne sont pas à prendre au pied de la lettre — remplacer par des données réelles pour tout usage client.
+
+### 3.3 Démarrage en mode réel (données APIs — ~10-15 min)
+
+```bash
+# Télécharger les données réelles depuis PVGIS, ERA5, ODRE
 python download_france_data.py
+
+# Options disponibles :
+python download_france_data.py --lat 50.93 --lon 2.38   # coordonnées client
+python download_france_data.py --year 2021               # année météo
+python download_france_data.py --epex epex_2024.csv      # CSV EPEX fourni
 ```
 
-Ce script va créer toute la structure `database/` avec :
-- Des données synthétiques (disponibles immédiatement)
-- Des données réelles depuis PVGIS et Open-Meteo (si connexion internet disponible)
+### 3.4 Calcul depuis Python (sans Streamlit)
 
----
-
-## Étape 3 : Remplacer les données par des données réelles (recommandé)
-
-### 3.1 Prix EPEX Spot (énergie réseau)
-
-**Source :** ODRE (Open Data Réseaux Énergies)
-**URL :** https://odre.opendatasoft.com/explore/dataset/prix-spot-da-horaires/
-
-```
-1. Aller sur https://odre.opendatasoft.com
-2. Rechercher "Prix spot Day-Ahead horaires France"
-3. Télécharger toutes les années en CSV
-4. Placer dans database/epex_spot_france.csv
-```
-
-Puis modifier `FranceGridUtils.py` :
 ```python
-temporal_df, contract_fee = process_france_grid_data(
-    year=2030,
-    epex_filepath="database/epex_spot_france.csv",
-    turpe_params=None  # utilise valeurs CRE 2024 par défaut
+from ppamodule import run_model, compare_scenarios
+
+# Scénario unique
+results = run_model(
+    xlsx_path='scenario_defaults.xlsx',
+    scenario_col='PPA100_ArcelorMittal_MU',
+    load_col='siderurgie',
+    save_output=True,
 )
+print(f"VAN : {results['npv_eur']/1e6:.1f} M€  |  Payback : {results['payback_years']} ans")
+
+# Comparaison de tous les scénarios
+df = compare_scenarios('scenario_defaults.xlsx',
+    ['PPA100_ArcelorMittal_MU', 'PPA100_ArcelorMittal_LU', 'PPA100_H2_Normandie'])
+print(df[['scenario', 'npv_meur', 'coverage_pct', 'net_cost_eur_mwh']])
 ```
 
-### 3.2 Intensité CO2 et mix énergétique (grid.csv)
+### 3.5 Données GIS (optionnel — scénarios on-site uniquement)
 
-**Source :** RTE eco2mix via ODRE
-**URL :** https://odre.opendatasoft.com/explore/dataset/eco2mix-national-cons-def/
+```bash
+# Construire la grille de terrains candidats autour du site client
+python build_land_grid.py --lat 50.93 --lon 2.38 --buffer 30
 
-```
-1. Filtrer : toutes les années disponibles
-2. Colonnes utiles : "Date - Heure", "Taux de CO2 (g/kWh)", "Taux d'EnR (%)"
-3. Télécharger en CSV
-4. Passer le chemin à build_france_grid_info(eco2mix_filepath="...")
-```
+# Mode test sans internet
+python build_land_grid.py --lat 50.93 --lon 2.38 --synthetic
 
-### 3.3 TURPE HTB (tarif réseau)
-
-**Source :** CRE (Commission de Régulation de l'Énergie)
-**URL :** https://www.cre.fr/Electricite/Reseaux-d-electricite/Tarifs-d-acces
-
-```
-Valeurs TURPE 6 HTB 2 (en vigueur 2024) :
-- Composante souscrite : 7.5 €/kW/an (HTB2 - 225kV)
-- Composante HPH : 5.2 €/MWh
-- Composante HCH : 1.8 €/MWh
-- Composante HPE : 1.0 €/MWh
-- Composante HCE : 0.5 €/MWh
-
-⚠️  Ces tarifs sont révisés chaque année par délibération CRE.
-    Vérifiez toujours la version en vigueur sur cre.fr.
+# Résultat : gisdata/db_semippa_auto.gpkg + .csv + _map.html
 ```
 
-### 3.4 Prix des Garanties d'Origine (= RECs coréens)
-
-**Source :** EEX Environmental Markets
-**URL :** https://www.eex.com/en/market-data/environmental-markets/go-market
-
-```
-Prix 2024 : ~5-15 €/MWh (variable selon source)
-Dans scenario_defaults.xlsx : mettre "Initial REC Price (KRW/MWh)" = 10000
-(avec currency_exchange = 1, ce sera 10 €/MWh)
-```
-
-### 3.5 Profils solaires (PVGIS)
-
-**API directe (gratuite, sans inscription) :**
-```python
-# Exemple pour le site industriel de votre client
-from download_france_data import download_pvgis_solar_profile
-
-download_pvgis_solar_profile(
-    lat=48.86,   # Latitude de votre site (ex: Paris)
-    lon=2.35,    # Longitude
-    year=2020,   # Année météo de référence
-    output_db="database/solar_patterns.db"
-)
-```
-
-### 3.6 Profils éoliens offshore
-
-**Via Open-Meteo (gratuit, sans inscription) :**
-```python
-from download_france_data import download_wind_profile_openmeteo
-
-# Télécharger pour chaque zone éolienne accessible depuis votre site
-for region, lat, lon in [
-    ("Hauts-de-France", 51.0, 2.5),
-    ("Normandie", 49.8, 0.5),
-]:
-    download_wind_profile_openmeteo(lat, lon, year=2020,
-                                     region_name=region)
-```
-
-**Pour des données ERA5 de qualité recherche :**
-```
-1. S'inscrire sur https://cds.climate.copernicus.eu
-2. Installer cdsapi : pip install cdsapi
-3. Télécharger wind_speed_100m pour les coordonnées offshore françaises
-```
+> `build_land_grid.py` n'est nécessaire que pour les scénarios on-site. Pour tous les scénarios off-site, cette étape est facultative.
 
 ---
 
-## Étape 4 : Données GIS (gisdata/) — La partie la plus complexe
+## 4. Remplacer les données synthétiques par des données réelles
 
-Le projet coréen utilisait des données GIS propriétaires sur les terrains disponibles
-autour des sites SK/Samsung. Pour la France, vous devez reconstituer ces données.
-
-### 4.1 Site de l'industriel (clusterpolygon.gpkg)
-
-C'est le polygone du/des site(s) de votre client industriel.
-
-**Comment l'obtenir :**
-```
-Option A : Dessiner manuellement dans QGIS (gratuit)
-   - Installer QGIS : https://www.qgis.org
-   - Créer une couche vecteur polygone
-   - Dessiner les limites du site
-   - Exporter en GeoPackage (.gpkg)
-
-Option B : Données cadastrales IGN
-   - https://geoservices.ign.fr/parcellaire-express
-   - Rechercher la parcelle cadastrale du site
-   - Exporter en .gpkg
-```
-
-### 4.2 Grille de terrains disponibles (db_semippa.gpkg)
-
-C'est la couche la plus complexe — elle contient tous les terrains potentiels
-pour installer des panneaux solaires, avec leurs caractéristiques.
-
-**Sources françaises :**
-
-```
-A. RPG (Registre Parcellaire Graphique) — Terrains agricoles
-   URL : https://geoservices.ign.fr/rpg
-   → Contient les parcelles agricoles (potentiel agrivoltaïque)
-   → Colonnes utiles : surface, type culture, code commune
-
-B. BDTopo IGN — Zonage et occupation du sol
-   URL : https://geoservices.ign.fr/bdtopo
-   → Bâtiments, routes, cours d'eau (à exclure)
-   → Données sur les zones industrielles
-
-C. CORINE Land Cover — Occupation du sol
-   URL : https://www.statistiques.developpement-durable.gouv.fr/corine-land-cover
-   → Classes d'occupation du sol à 1:100000
-   → Identifier les zones compatibles ENR
-
-D. PLU/PLUi — Plan Local d'Urbanisme
-   URL : https://www.geoportail-urbanisme.gouv.fr
-   → Zonage réglementaire (zones A/N = agricole/naturel)
-   → Contraintes de constructibilité
-```
-
-**Script de création simplifié :**
-```python
-import geopandas as gpd
-import requests
-
-# Exemple : Télécharger RPG pour un département
-def download_rpg(departement: str = "59", year: int = 2023):
-    '''Télécharge le Registre Parcellaire Graphique depuis l'IGN.'''
-    url = f"https://data.geopf.fr/telechargement/download/RPG/RPG_{year}-01-01/RPG_{year}-01-01_SHP_LAMB93_D0{departement}_2024-09-16.7z"
-    # Note : Les URLs IGN changent selon les millésimes.
-    # Consulter https://geoservices.ign.fr/rpg pour l'URL exacte.
-    print(f"Télécharger manuellement depuis : {url}")
-    print("Puis convertir en GeoPackage avec QGIS ou ogr2ogr.")
-
-# Colonnes minimales requises par costutils.py :
-# - geometry   : polygone de la parcelle
-# - area_photo : surface disponible pour PV standard (m²)
-# - area_agrivol : surface disponible pour agrivoltaïque (m²)
-# - wavgprice  : prix moyen du terrain (€/m²)
-# - distance_0 : distance au site industriel (m) — calculée par process_grid_site_data()
-```
-
----
-
-## Étape 5 : Modifier ppamodule.py
-
-Voir `ppamodule_france_adaptations.py` pour la liste complète des modifications.
-
-**Modifications critiques (minimum requis) :**
-
-```python
-# Ligne ~50 dans run_model() :
-# AVANT :
-gridinf_df = pd.read_csv("database/grid.csv", index_col=0)
-# APRÈS :
-gridinf_df = pd.read_csv("database/grid_france.csv", index_col=0)
-
-# Ligne ~100 :
-# AVANT :
-wind_df = pd.read_excel('database/wind_grid.xlsx', index_col=0)
-wind_df = wind_df[wind_df['admin_boundaries'].str.contains('인천광역시|경기도|충청남도')]
-# APRÈS :
-wind_df = pd.read_excel('database/wind_grid_france.xlsx', index_col=0)
-wind_df = wind_df[wind_df['admin_boundaries'].str.contains(
-    'Hauts-de-France|Normandie|Bretagne|Pays de la Loire|Occitanie'
-)]
-
-# Ligne ~120 :
-# AVANT :
-filepath = "database/KEPCO.xlsx"
-# APRÈS :
-filepath = "database/KEPCO_france.xlsx"
-```
-
----
-
-## Étape 6 : Modifier scenario_defaults.xlsx
-
-| Paramètre | Valeur coréenne | → | Valeur française |
+| Donnée | Priorité | Comment obtenir | Impact si synthétique |
 |---|---|---|---|
-| Load for SK (MW) | 3000 | → | 100-400 |
-| Load for Samsung (MW) | 3000 | → | 0 ou 2nd site |
-| Currency Exchange Rate | 1400 | → | **1** |
-| Selected Sheet | HV_C_III | → | **HTB3** |
-| Initial SMP (KRW/MWh) | 167000 | → | **60000** (60 €/MWh) |
-| Initial REC Price (KRW/MWh) | 80000 | → | **10000** (10 €/MWh) |
-| Battery Capital Cost per MW | 1,000,000,000 | → | **600,000** (600 k€) |
-| Battery Capital Cost per MWh | 250,000,000 | → | **150,000** (150 k€) |
+| Courbe de charge client | 🔴 Critique | Export horodaté depuis ENEDIS (espace client) ou gestionnaire d'énergie. Format CSV datetime/MW. | Résultats VAN et couverture charge non fiables |
+| Prix EPEX Spot | 🟠 Haute | odre.opendatasoft.com → dataset `prix-spot-da-horaires` → Export CSV. Puis : `python download_france_data.py --epex epex.csv` | Capture rates et settlement approximatifs |
+| eco2mix CO2/ENR | 🟠 Haute | odre.opendatasoft.com → `eco2mix-national-cons-def`. Colonnes `taux_co2` et `taux_enr`. | Indicateurs ESG/Scope 2 approximatifs |
+| Parcs éoliens supplémentaires | 🟡 Normale | Compléter `wind_grid_france.xlsx` avec AO CRE 2021-2024 (thewindpower.net). | Mix PPA moins diversifié (12 parcs) |
+| TURPE actualisé | 🟡 Normale | Chaque 1er août : services-rte.com → Bibliothèque documentaire → Fiches tarifaires TURPE 6. | Coût réseau sous-estimé si +4-5%/an non appliqué |
+
+> ⚠️ **Priorité absolue** : obtenir la courbe de charge réelle du client industriel. C'est le seul paramètre qui ne peut pas être synthétisé de façon fiable — chaque site a un profil unique (fours à arc, électrolyseurs, process chimique...).
 
 ---
 
-## Correspondance des concepts Corée ↔ France
+## 5. Guide de l'interface Streamlit
 
-| Concept coréen | Équivalent français | Source données |
+| Page | Ce qu'on y fait |
+|---|---|
+| 🏠 **Accueil** | Vérifier le statut des 8 fichiers données. Voir les scénarios disponibles. Guide de démarrage rapide. |
+| 📊 **Data Explorer** | 9 onglets : profils solaires/éoliens/charge, EPEX Spot, capture rates, parcs éoliens (carte mapbox), complémentarité (matrice corrélation), qualité des données. |
+| ⚙️ **Scénario & Calcul** | Sélectionner un scénario, ajuster charge/WACC/durée/structure contractuelle. Configurer les clauses avancées (curtailment, prix négatifs, GOs, risques financiers). Cliquer **Lancer le calcul**. |
+| 📈 **Résultats** | KPIs : VAN, MW PPA, couverture charge %, coût net €/MWh, payback. Onglets : cashflow 20 ans, mix PPA (bar + camembert), sites screenés (scatter score), paramètres utilisés. |
+| 🗺️ **Carte GIS** | Carte Leaflet des parcelles candidates RPG. Stats surface/puissance PV/distance/prix foncier. Bouton pour reconstruire la grille. |
+
+> Le répertoire `database/` est configurable depuis la barre latérale. Le statut des 8 fichiers est mis à jour en temps réel avec un badge coloré.
+
+---
+
+## 6. Concepts clés du marché français
+
+### Capture Rate vs Prix Spot Moyen
+
+Le capture rate mesure la valeur réelle d'un parc sur le marché spot, par rapport au prix moyen annuel.
+
+```
+CR = (Σ production(t) × spot(t)) / (Σ production(t)) / spot_moyen_annuel
+```
+
+| Technologie | Capture Rate typique France | Interprétation |
 |---|---|---|
-| KEPCO (fournisseur réseau) | EDF/fournisseur alternatif | CRE / contrat |
-| Tarif HV_C (haute tension) | TURPE HTB (63/225/400 kV) | cre.fr |
-| SMP (System Marginal Price) | Prix EPEX Spot Day-Ahead | odre.opendatasoft.com |
-| REC (Renewable Energy Cert.) | GO (Garantie d'Origine) | eex.com |
-| ETS coréen | EU ETS | prix-co2.fr / EEX |
-| CO2 intensity 450 gCO2/kWh | CO2 intensity 55 gCO2/kWh | eco2mix RTE |
-| Zone KEPCO (Corée) | Zone de desserte ENEDIS/RTE | data.enedis.fr |
-| Land price (won/m²) | Prix terrain (€/m²) | DVF / notaires |
+| Éolien offshore hivernal | 1.05 – 1.15 | Produit aux heures de pointe hiver → CR > 1 |
+| Éolien onshore | 0.95 – 1.05 | Production répartie, moins ciblée sur les pointes |
+| Solaire PV (latitude 50°N) | 0.82 – 0.92 | Midi solaire = heures de cannibalisation ENR |
+| Solaire PV (latitude 44°N) | 0.78 – 0.88 | Cannibalisation plus forte dans le Sud |
+
+### Structure PPA physique sleeved (dominante France 2024)
+
+Le sleeving est la structure standard en France (> 65% des contrats). Le producteur injecte sa production au réseau au prix spot ; un fournisseur intermédiaire (sléeveur) aligne les flux financiers.
+
+| Flux | Qui paie / reçoit quoi |
+|---|---|
+| Producteur → Réseau | Injecte les MWh au prix spot du marché |
+| Sléeveur → Producteur | Verse le complément (PPA_price − spot) si PPA_price > spot |
+| Acheteur → Sléeveur | Paie PPA_price × volume + sleeving_fee (2-5 €/MWh) |
+| Settlement CfD net | (PPA_price − spot) × volume = transfert acheteur/producteur |
+
+### TURPE péréquation — la règle d'or
+
+En France, le TURPE est **identique partout sur le territoire**. La localisation du site industriel ou du parc ENR n'impacte pas le tarif réseau. Seul le niveau de tension de raccordement (HTB3 / HTB2 / HTB1) différencie les tarifs. C'est fondamentalement différent du modèle coréen où la zone géographique KEPCO déterminait le tarif.
+
+### Fin de l'ARENH (janvier 2026)
+
+> ⚠️ L'ARENH (42 €/MWh) a expiré fin décembre 2025. Son successeur, les contrats de long terme EDF (**CPP — Contrats à Prix Plafond**, estimés 60-70 €/MWh sur 15 ans), constitue désormais la principale alternative aux PPAs renouvelables. À intégrer comme scénario de référence alternatif dans les analyses client.
+
+### Garanties d'Origine (GOs) ≠ RECs coréens
+
+| Paramètre | GOs France | RECs Corée |
+|---|---|---|
+| Prix 2024 | 3 – 15 €/MWh selon granularité | ~57 €/MWh (80 000 KRW) |
+| Impact sur décision PPA | Faible (< 5% du différentiel coût) | Significatif |
+| Granularité annual | 5 – 8 €/MWh | Standard |
+| Granularité monthly | 7 – 11 €/MWh (+40%) | N/A |
+| Granularité hourly / 24-7 CFE | 10 – 20 €/MWh (+120%) | N/A |
+| Marché | AIB / EEX Environmental Markets | KPX |
 
 ---
 
-## Questions fréquentes
+## 7. Migration Corée → France — correspondances
 
-**Q : Pourquoi le CO2 français est-il si différent (55 vs 450 gCO2/kWh) ?**
-R : La France produit ~70% de son électricité avec le nucléaire, qui est quasi-zéro carbone.
-   Cela change fondamentalement la logique économique des PPAs : en France, l'argument
-   est moins la décarbonation (déjà très bonne) que l'indépendance au prix de marché
-   et l'amélioration de la compétitivité par rapport aux prix EPEX spot volatils.
+| Concept / fichier coréen | Équivalent français v3.0 | Note |
+|---|---|---|
+| `KEPCOutils.py` | `FranceGridUtils.py` | Entièrement réécrit. Même logique, données françaises. |
+| `KEPCO.xlsx` / `KEPCO_france.xlsx` | `TURPE_france.xlsx` | Ancienne appellation supprimée. |
+| `ppamodule_france_adaptations.py` | `ppamodule.py` (natif) | Le fichier de patch n'existe plus. |
+| `grid.csv` | `database/grid_france.csv` | Nouvelles colonnes : `wind_onshore_capex`, `bess_capex_per_mwh`, `epex_spot_mean`... |
+| `wind_grid.xlsx` | `database/wind_grid_france.xlsx` | 12 parcs (vs 6 offshore seulement avant). |
+| SMP (System Marginal Price) | EPEX Spot Day-Ahead France | Même mécanique de prix marginal, marché européen couplé. |
+| REC (Renewable Energy Cert.) | GO (Garantie d'Origine) | Prix ~10× plus bas en France qu'en Corée. |
+| Currency Exchange Rate KRW/USD | Currency = 1.0 (EUR natif) | Paramètre maintenu dans scenario_defaults mais toujours = 1. |
+| Load for SK / Load for Samsung | Load ArcelorMittal / Load H2 Normandie | Mêmes paramètres, noms francisés. |
+| HV_C_I / HV_C_II / HV_C_III | HTB3 / HTB2 / HTB1 | Correspondance directe par niveau de tension. |
+| CO2 ~450 gCO2/kWh | CO2 ~47 gCO2/kWh (2024) | France = nucléaire 70%. Argument PPA = prix, pas CO2. |
 
-**Q : Les RECs (GOs) étant si peu chères en France, ça change quoi ?**
-R : Oui, significativement. En Corée, les RECs à 80 000 KRW/MWh (~57 €/MWh) représentaient
-   un coût important qui justifiait des PPAs même plus chers. En France, les GOs à 8-15 €/MWh
-   ont un impact beaucoup plus faible sur le calcul du LCOE renouvelable.
-   La décision PPA se prend donc davantage sur la compétitivité prix pure.
+---
 
-**Q : Quid de l'ARENH ?**
-R : L'ARENH (Accès Régulé à l'Énergie Nucléaire Historique) donnait aux industriels accès
-   à l'électricité nucléaire d'EDF à prix régulé (42 €/MWh). Il a expiré fin 2025.
-   Son successeur (CSPE réformée, contrats de long terme EDF) doit être pris en compte
-   comme alternative aux PPAs renouvelables dans votre modèle.
-   C'est l'équivalent d'un "KEPCO ultra-compétitif" qui concurrence les PPAs.
+## 8. Sources officielles
+
+| Source | Données | URL |
+|---|---|---|
+| ODRE | Prix EPEX DA horaires, eco2mix CO2/ENR | odre.opendatasoft.com |
+| CRE | AO solaire/éolien/H2, délibérations TURPE | cre.fr |
+| Services-RTE | Fiches tarifaires TURPE 6 HTB | services-rte.com |
+| RTE Futurs Énergétiques | Scénarios CO2, ENR, prix long terme | rte-france.com/analyses-tendances-et-prospectives |
+| PVGIS JRC | Profils PV horaires par coordonnées GPS | pvgis.ec.europa.eu |
+| Open-Meteo ERA5 | Profils vent 100m horaires, réanalyse | archive-api.open-meteo.com |
+| IGN Géoplateforme | RPG parcelles agricoles, ZNIEFF, Natura 2000 | data.geopf.fr/wfs/wfs |
+| DVF data.gouv.fr | Prix terrain foncier par département | files.data.gouv.fr/geo-dvf/latest/csv |
+| IRENA | CAPEX ENR et BESS mondiaux | irena.org/publications |
+| AIB / EEX | Prix Garanties d'Origine | aib-net.org · eex.com/environmental-markets |
+| Damodaran | WACC par secteur et pays | pages.stern.nyu.edu/~adamodar |
+| WindEurope | Statistiques offshore Europe | windeurope.org/intelligence-platform |
+| BloombergNEF | BESS CAPEX, prix carbone ETS | bloomberg.com/professional |
+
+---
+
+*French PPA Model v3.0 — Mars 2026 — Usage confidentiel*
